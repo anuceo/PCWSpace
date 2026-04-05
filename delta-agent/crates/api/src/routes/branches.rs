@@ -8,7 +8,7 @@ struct BranchResponse {
 }
 
 pub fn router() -> Router {
-    Router::new().route("/branches/:id", get(get_branch))
+    Router::new().route("/branches/{id}", get(get_branch))
 }
 
 async fn get_branch(Path(id): Path<String>) -> Json<BranchResponse> {

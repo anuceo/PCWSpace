@@ -8,7 +8,7 @@ struct SessionResponse {
 }
 
 pub fn router() -> Router {
-    Router::new().route("/sessions/:id", get(get_session))
+    Router::new().route("/sessions/{id}", get(get_session))
 }
 
 async fn get_session(Path(id): Path<String>) -> Json<SessionResponse> {

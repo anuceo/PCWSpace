@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Context;
 use tracing::{info, Level};
 
-use crate::config::{load, ServerConfig};
+use crate::config::load;
 
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
