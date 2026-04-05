@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/deltashot",
+    "crates/vddab",
+    "crates/penpal",
+    "crates/snapshot",
+    "crates/scheduler",
+    "crates/streaming",
+    "crates/cache",
+    "crates/compression",
+    "crates/hashing",
+    "crates/replay",
+    "crates/api",
+    "crates/trace",
+    "apps/server",
+    "apps/worker"
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+authors = ["Delta Agent Team"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+axum = "0.8"
+blake3 = "1"
+brotli = "8"
+lru = "0.16"
+rayon = "1"
+tracing = "0.1"
+tokio-stream = "0.1"
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }

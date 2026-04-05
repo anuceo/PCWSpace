@@ -1,0 +1,11 @@
+[package]
+name = "replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rayon.workspace = true
+delta-core = { path = "../core" }
+hashing = { path = "../hashing" }
