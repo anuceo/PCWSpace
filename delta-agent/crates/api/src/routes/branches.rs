@@ -1,8 +1,4 @@
-use axum::{
-    extract::Path,
-    routing::get,
-    Json, Router,
-};
+use axum::{extract::Path, routing::get, Json, Router};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]

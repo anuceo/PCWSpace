@@ -18,7 +18,10 @@ impl EventBus {
         Self { sender }
     }
 
-    pub fn publish(&self, event: StreamEvent) -> Result<usize, broadcast::error::SendError<StreamEvent>> {
+    pub fn publish(
+        &self,
+        event: StreamEvent,
+    ) -> Result<usize, broadcast::error::SendError<StreamEvent>> {
         self.sender.send(event)
     }
 

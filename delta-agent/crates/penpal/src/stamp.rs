@@ -11,6 +11,9 @@ impl PenpalStamp {
         let lattice_key = lattice_key.into();
         let digest = blake3::hash(payload).to_hex().to_string();
 
-        Self { lattice_key, digest }
+        Self {
+            lattice_key,
+            digest,
+        }
     }
 }
