@@ -76,6 +76,80 @@ Overrides:
 - `DELTA_AGENT_CONFIG` (default: `configs/default.toml`)
 - `RUST_LOG` (default: `worker=info`)
 
+## API v1 Contract
+
+Base path:
+
+`/api/v1`
+
+### Core endpoints
+
+- `POST /api/v1/workspaces`
+- `GET /api/v1/workspaces/{workspaceId}`
+- `GET /api/v1/workspaces/{workspaceId}/sessions?limit=20&cursor=<timestamp>`
+- `POST /api/v1/sessions`
+- `POST /api/v1/sessions/{sessionId}/messages`
+- `GET /api/v1/sessions/{sessionId}/state`
+- `GET /api/v1/sessions/{sessionId}/messages?limit=50&cursor=<message_id>`
+- `GET /api/v1/sessions/{sessionId}/deltashots`
+- `GET /api/v1/deltashots/{deltashotId}`
+- `POST /api/v1/sessions/{sessionId}/rollback`
+- `POST /api/v1/artifacts`
+- `GET /api/v1/artifacts/{artifactId}`
+- `GET /api/v1/artifacts/{artifactId}/versions`
+- `GET /api/v1/artifacts/{artifactId}/versions/{version}`
+- `POST /api/v1/workflows/start`
+- `GET /api/v1/workflows/{workflowId}/state`
+- `POST /api/v1/workflows/{workflowId}/step`
+- `POST /api/v1/sessions/{sessionId}/agent`
+- `GET /api/v1/sessions/{sessionId}/agents/logs`
+- `GET /api/v1/sessions/{sessionId}/trace`
+- `GET /api/v1/health`
+
+### Response metadata
+
+All successful responses include:
+
+```json
+{
+  "...": "...",
+  "meta": {
+    "request_id": "req_123",
+    "timestamp": 1775453669005,
+    "latency_ms": 12
+  }
+}
+```
+
+Errors follow:
+
+```json
+{
+  "error": {
+    "code": "SESSION_LOCKED",
+    "message": "session lock unavailable",
+    "retryable": true
+  },
+  "meta": {
+    "request_id": "req_123",
+    "timestamp": 1775453669005,
+    "latency_ms": 1
+  }
+}
+```
+
+### Deterministic message entrypoint example
+
+```bash
+curl -X POST "http://127.0.0.1:8080/api/v1/sessions/sess_2/messages" \
+  -H "content-type: application/json" \
+  -d '{
+    "content": "Create a landing page for my product",
+    "mode": "workflow",
+    "metadata": {"priority":"normal"}
+  }'
+```
+
 ## Cloud agent environment
 
 The repository root contains `.cursor/environment.json` to speed up and
