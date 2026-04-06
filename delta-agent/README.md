@@ -82,6 +82,11 @@ Base path:
 
 `/api/v1`
 
+Formal spec artifacts:
+
+- `docs/api-contract-v1.md`
+- `docs/openapi.v1.json`
+
 ### Core endpoints
 
 - `POST /api/v1/workspaces`

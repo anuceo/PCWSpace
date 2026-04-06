@@ -11,10 +11,10 @@ use axum::{
 use serde::Deserialize;
 
 use crate::pipeline::{
-    ApiEnvelope, ApiErrorBody, ApiErrorEnvelope, ApiResponseMeta, ArtifactVersionView,
-    ArtifactWriteRequest, CreateSessionRequest, CreateWorkspaceRequest, DeltashotView,
-    ExecutionTrace, ForceAgentRequest, MessageRecord, PipelineError, PipelineState,
-    RollbackRequest, SendMessageRequestV1, SessionView, WorkflowStartRequest, WorkflowStepRequest,
+    ApiErrorBody, ApiErrorEnvelope, ApiResponseMeta, ArtifactVersionView, ArtifactWriteRequest,
+    CreateSessionRequest, CreateWorkspaceRequest, DeltashotView, ExecutionTrace,
+    ForceAgentRequest, MessageRecord, PipelineError, PipelineState, RollbackRequest,
+    SendMessageRequestV1, SessionView, WorkflowStartRequest, WorkflowStepRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -302,15 +302,26 @@ where
     let now = now_ms();
     match fut.await {
         Ok(data) => {
-            let envelope = ApiEnvelope {
-                data,
-                meta: ApiResponseMeta {
-                    request_id,
-                    timestamp: now,
-                    latency_ms: started.elapsed().as_millis() as u64,
-                },
+            let payload = serde_json::to_value(data).unwrap_or_else(|_| serde_json::json!({}));
+            let meta = serde_json::to_value(ApiResponseMeta {
+                request_id,
+                timestamp: now,
+                latency_ms: started.elapsed().as_millis() as u64,
+            })
+            .unwrap_or_else(|_| serde_json::json!({}));
+
+            let response = match payload {
+                serde_json::Value::Object(mut object) => {
+                    object.insert("meta".to_owned(), meta);
+                    serde_json::Value::Object(object)
+                }
+                other => serde_json::json!({
+                    "value": other,
+                    "meta": meta,
+                }),
             };
-            (StatusCode::OK, Json(envelope)).into_response()
+
+            (StatusCode::OK, Json(response)).into_response()
         }
         Err(error) => {
             let status = match error {

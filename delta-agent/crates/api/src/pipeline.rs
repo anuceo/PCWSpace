@@ -157,6 +157,11 @@ pub struct SessionView {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceSessionsResponse {
+    pub sessions: Vec<SessionView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct MessageEnvelope {
     pub id: String,
     pub role: String,
@@ -220,6 +225,11 @@ pub struct MessageRecord {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SessionMessagesResponse {
+    pub messages: Vec<MessageRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DeltashotView {
     pub id: String,
     pub timestamp: u64,
@@ -228,6 +238,11 @@ pub struct DeltashotView {
     pub diff: Value,
     pub hash: String,
     pub prev_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionDeltashotsResponse {
+    pub deltashots: Vec<DeltashotView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -241,6 +256,11 @@ pub struct RollbackResponse {
 pub struct ArtifactVersionView {
     pub version: u64,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactVersionsResponse {
+    pub versions: Vec<ArtifactVersionView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -282,6 +302,11 @@ pub struct AgentLogEntry {
     pub ts: u64,
     pub selected_agent: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentLogsResponse {
+    pub logs: Vec<AgentLogEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
