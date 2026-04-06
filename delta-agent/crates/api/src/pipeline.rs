@@ -17,6 +17,7 @@ const RECENT_MESSAGE_WINDOW: usize = 20;
 const SESSION_LOCK_TTL_SECS: u64 = 5;
 const SESSION_LOCK_RETRIES: usize = 3;
 const LOCK_RETRY_DELAY_MS: u64 = 40;
+const EVENT_TYPE_EXECUTION_STEP: &str = "EXECUTION_STEP";
 
 static PIPELINE: OnceLock<ExecutionPipeline> = OnceLock::new();
 
@@ -261,6 +262,15 @@ pub struct WorkflowStateView {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct WorkflowExecutionResult {
+    pub workflow_id: String,
+    pub session_id: String,
+    pub step: String,
+    pub deltashot_id: String,
+    pub state_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentSelectionView {
     pub session_id: String,
     pub agent: String,
@@ -305,7 +315,6 @@ pub struct ApiResponseMeta {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiEnvelope<T: Serialize> {
-    #[serde(flatten)]
     pub data: T,
     pub meta: ApiResponseMeta,
 }
@@ -468,6 +477,12 @@ struct AgentOutput {
     proposed_step: Option<String>,
     artifact_type: Option<String>,
     artifact_content: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactWriteOutcome {
+    envelope: ArtifactEnvelope,
+    previous_content: Option<String>,
 }
 
 #[derive(Debug)]
@@ -648,15 +663,36 @@ impl ExecutionPipeline {
         session_id: &str,
         request: SendMessageRequestV1,
     ) -> Result<SendMessageResponseV1, PipelineError> {
+        self.record_execution_step(
+            session_id,
+            "API_ENTRY",
+            serde_json::json!({
+                "route": "POST /api/v1/sessions/{sessionId}/messages",
+            }),
+        )
+        .await?;
+
         if request.content.trim().is_empty() {
             return Err(PipelineError::InvalidInput(
                 "message content cannot be empty".to_owned(),
             ));
         }
 
+        self.record_execution_step(session_id, "SESSION_HYDRATE_START", Value::Null)
+            .await?;
         let lock_key = self.acquire_session_lock(session_id).await?;
+        self.record_execution_step(
+            session_id,
+            "LOCK_ACQUIRED",
+            serde_json::json!({ "lock_key": lock_key.clone() }),
+        )
+        .await?;
+
         let result = self.run_locked_message_pipeline(session_id, request).await;
         self.release_lock(&lock_key).await;
+        let _ = self
+            .record_execution_step(session_id, "LOCK_RELEASED", Value::Null)
+            .await;
         result
     }
 
@@ -666,10 +702,22 @@ impl ExecutionPipeline {
         request: SendMessageRequestV1,
     ) -> Result<SendMessageResponseV1, PipelineError> {
         let context = self.hydrate_context(session_id).await;
+        self.record_execution_step(
+            session_id,
+            "SESSION_HYDRATED",
+            serde_json::json!({ "memory_len": context.memory.len() }),
+        )
+        .await?;
 
         let user_message = self
             .append_message(session_id, "user", &request.content)
             .await?;
+        self.record_execution_step(
+            session_id,
+            "USER_MESSAGE_APPENDED",
+            serde_json::json!({ "message_id": user_message.id }),
+        )
+        .await?;
 
         let (agent, reason) = select_agent(
             &request.content,
@@ -677,12 +725,26 @@ impl ExecutionPipeline {
             context.forced_agent.as_ref(),
         );
         self.append_agent_log(session_id, &agent, &reason).await;
+        self.record_execution_step(
+            session_id,
+            "AGENT_ROUTED",
+            serde_json::json!({ "reason": reason }),
+        )
+        .await?;
 
         let agent_output = run_agent(agent, &request.content, &context, &request.mode);
+        self.record_execution_step(session_id, "AGENT_EXECUTED", Value::Null)
+            .await?;
 
         let prev_state = context.state.clone();
         let next_state = apply_state_mutation(&prev_state, &request.content, &agent_output);
         let diff = compute_diff(&prev_state, &next_state);
+        self.record_execution_step(
+            session_id,
+            "STATE_DIFF_COMPUTED",
+            serde_json::json!({ "changes": diff.get("changes").cloned().unwrap_or(Value::Null) }),
+        )
+        .await?;
 
         let state_event = self
             .append_event(session_id, EVENT_TYPE_STATE_UPDATE, diff.clone())
@@ -696,16 +758,34 @@ impl ExecutionPipeline {
                 next_state.clone(),
             )
             .await?;
+        self.record_execution_step(
+            session_id,
+            "DELTASHOT_CREATED",
+            serde_json::json!({ "deltashot_id": deltashot.id }),
+        )
+        .await?;
 
         let mut artifacts = Vec::new();
         if let (Some(artifact_type), Some(content)) = (
             agent_output.artifact_type.clone(),
             agent_output.artifact_content.clone(),
         ) {
-            let artifact = self
+            let artifact_outcome = self
                 .create_or_update_artifact_internal(session_id, &artifact_type, &content)
                 .await?;
+            let artifact = artifact_outcome.envelope.clone();
             artifacts.push(artifact.clone());
+
+            let content_diff = match artifact_outcome.previous_content {
+                Some(previous) => serde_json::json!({
+                    "from": previous,
+                    "to": content,
+                }),
+                None => serde_json::json!({
+                    "from": "",
+                    "to": content,
+                }),
+            };
 
             let _ = self
                 .append_event(
@@ -715,9 +795,19 @@ impl ExecutionPipeline {
                         "artifact_id": artifact.artifact_id,
                         "version": artifact.version,
                         "type": artifact.artifact_type,
+                        "content_diff": content_diff,
                     }),
                 )
                 .await?;
+            self.record_execution_step(
+                session_id,
+                "ARTIFACT_UPDATED",
+                serde_json::json!({
+                    "artifact_id": artifact.artifact_id,
+                    "version": artifact.version
+                }),
+            )
+            .await?;
         }
 
         let agent_message = self
@@ -735,8 +825,12 @@ impl ExecutionPipeline {
                 }),
             )
             .await?;
+        self.record_execution_step(session_id, "AGENT_MESSAGE_APPENDED", Value::Null)
+            .await?;
 
         self.persist_state(session_id, next_state.clone()).await?;
+        self.record_execution_step(session_id, "STATE_PERSISTED", Value::Null)
+            .await?;
 
         let workflow_step = next_state
             .step
@@ -754,10 +848,18 @@ impl ExecutionPipeline {
             self.enqueue_workflow(&workflow_id, session_id, &workflow_step, Value::Null)
                 .await;
             self.bind_session_workflow(session_id, &workflow_id).await;
+            self.record_execution_step(
+                session_id,
+                "WORKFLOW_ENQUEUED",
+                serde_json::json!({ "workflow_id": workflow_id, "step": workflow_step.clone() }),
+            )
+            .await?;
         }
 
         self.enqueue_notion_sync(session_id, &agent_output.text, &artifacts)
             .await;
+        self.record_execution_step(session_id, "NOTION_SYNC_ENQUEUED", Value::Null)
+            .await?;
 
         info!(
             session_id = %session_id,
@@ -909,12 +1011,26 @@ impl ExecutionPipeline {
             let target_id = request.target_deltashot_id.clone();
             let mode = request.mode.to_ascii_lowercase();
 
-            let target = {
-                let deltas = self.deltashots.read().await;
-                deltas.get(&target_id).cloned().ok_or_else(|| {
-                    PipelineError::NotFound(format!("deltashot '{}' not found", target_id))
-                })?
+            let (target_index, replay_ids, prev_state) = {
+                let sessions = self.sessions.read().await;
+                let session = sessions.get(session_id).ok_or_else(|| {
+                    PipelineError::NotFound(format!("session '{}' not found", session_id))
+                })?;
+                let idx = session
+                    .deltashot_ids
+                    .iter()
+                    .position(|id| id == &target_id)
+                    .ok_or_else(|| {
+                        PipelineError::NotFound(format!("deltashot '{}' not found", target_id))
+                    })?;
+                (
+                    idx,
+                    session.deltashot_ids[..=idx].to_vec(),
+                    session.state.clone(),
+                )
             };
+
+            let rebuilt_state = self.replay_state_from_deltashot_ids(&replay_ids).await?;
 
             let mut sessions = self.sessions.write().await;
             let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
@@ -924,20 +1040,16 @@ impl ExecutionPipeline {
                     "Adhoc Session".to_owned(),
                 )
             });
-
-            let prev = session.state.clone();
-            session.state = target.state_snapshot.clone();
+            session.state = rebuilt_state.clone();
 
             if mode == "hard" {
-                if let Some(idx) = session.deltashot_ids.iter().position(|id| id == &target_id) {
-                    session.deltashot_ids.truncate(idx + 1);
-                    session.hashchain.truncate(idx + 1);
-                }
+                session.deltashot_ids.truncate(target_index + 1);
+                session.hashchain.truncate(target_index + 1);
             }
 
             drop(sessions);
 
-            let rollback_diff = compute_diff(&prev, &target.state_snapshot);
+            let rollback_diff = compute_diff(&prev_state, &rebuilt_state);
             let rollback_event = self
                 .append_event(session_id, "ROLLBACK", rollback_diff)
                 .await?;
@@ -947,13 +1059,24 @@ impl ExecutionPipeline {
                     session_id,
                     "ROLLBACK",
                     rollback_event.payload,
-                    target.state_snapshot.clone(),
+                    rebuilt_state.clone(),
                 )
                 .await?;
 
+            self.record_execution_step(
+                session_id,
+                "ROLLBACK_APPLIED",
+                serde_json::json!({
+                    "target_deltashot_id": target_id,
+                    "mode": mode,
+                    "new_deltashot_id": rollback_ds.id
+                }),
+            )
+            .await?;
+
             Ok::<RollbackResponse, PipelineError>(RollbackResponse {
                 status: "rolled_back".to_owned(),
-                current_state_version: target.state_snapshot.version,
+                current_state_version: rebuilt_state.version,
                 new_deltashot_id: rollback_ds.id,
             })
         }
@@ -967,12 +1090,14 @@ impl ExecutionPipeline {
         &self,
         request: ArtifactWriteRequest,
     ) -> Result<ArtifactEnvelope, PipelineError> {
-        self.create_or_update_artifact_internal(
-            &request.session_id,
-            &request.artifact_type,
-            &request.content,
-        )
-        .await
+        let outcome = self
+            .create_or_update_artifact_internal(
+                &request.session_id,
+                &request.artifact_type,
+                &request.content,
+            )
+            .await?;
+        Ok(outcome.envelope)
     }
 
     pub async fn get_artifact(&self, artifact_id: &str) -> Option<ArtifactView> {
@@ -1087,6 +1212,57 @@ impl ExecutionPipeline {
             session_id: Some(session_id),
             current_step: request.step,
         })
+    }
+
+    pub async fn execute_next_workflow_job(
+        &self,
+    ) -> Result<Option<WorkflowExecutionResult>, PipelineError> {
+        let next_job = {
+            let mut queue = self.workflow_queue.lock().await;
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        };
+
+        let Some(job) = next_job else {
+            return Ok(None);
+        };
+
+        let payload = serde_json::from_str::<Value>(&job.payload).unwrap_or(Value::Null);
+        let content = format!(
+            "workflow job {} step {} payload {}",
+            job.workflow_id, job.step, payload
+        );
+
+        let request = SendMessageRequestV1 {
+            content,
+            mode: MessageMode::Workflow,
+            metadata: serde_json::json!({
+                "trigger": "workflow_queue",
+                "workflow_id": job.workflow_id,
+                "step": job.step,
+                "enqueued_at": job.timestamp_ms,
+            }),
+        };
+
+        match self.handle_message_v1(&job.session_id, request).await {
+            Ok(response) => Ok(Some(WorkflowExecutionResult {
+                workflow_id: job.workflow_id,
+                session_id: job.session_id,
+                step: job.step,
+                deltashot_id: response.deltashot.id,
+                state_version: response.state.version,
+            })),
+            Err(error) => {
+                if matches!(error, PipelineError::LockUnavailable) {
+                    let mut queue = self.workflow_queue.lock().await;
+                    queue.push(job);
+                }
+                Err(error)
+            }
+        }
     }
 
     pub async fn force_agent_selection(
@@ -1354,7 +1530,7 @@ impl ExecutionPipeline {
         session_id: &str,
         artifact_type: &str,
         content: &str,
-    ) -> Result<ArtifactEnvelope, PipelineError> {
+    ) -> Result<ArtifactWriteOutcome, PipelineError> {
         let mut artifacts = self.artifacts.write().await;
         let artifact_id = format!("art_{}", session_id);
         let record = artifacts
@@ -1368,6 +1544,7 @@ impl ExecutionPipeline {
                 versions: BTreeMap::new(),
             });
 
+        let previous_content = record.versions.get(&record.current_version).cloned();
         record.current_version += 1;
         record
             .versions
@@ -1385,10 +1562,13 @@ impl ExecutionPipeline {
             session.artifacts.insert(artifact_id.clone());
         }
 
-        Ok(ArtifactEnvelope {
-            artifact_id,
-            version: record.current_version,
-            artifact_type: record.artifact_type.clone(),
+        Ok(ArtifactWriteOutcome {
+            envelope: ArtifactEnvelope {
+                artifact_id,
+                version: record.current_version,
+                artifact_type: record.artifact_type.clone(),
+            },
+            previous_content,
         })
     }
 
@@ -1492,6 +1672,42 @@ impl ExecutionPipeline {
             q.push(job);
             info!(session_id = %session_id, "notion sync enqueued");
         });
+    }
+
+    async fn record_execution_step(
+        &self,
+        session_id: &str,
+        step: &str,
+        details: Value,
+    ) -> Result<(), PipelineError> {
+        let _ = self
+            .append_event(
+                session_id,
+                EVENT_TYPE_EXECUTION_STEP,
+                serde_json::json!({
+                    "step": step,
+                    "details": details,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn replay_state_from_deltashot_ids(
+        &self,
+        deltashot_ids: &[String],
+    ) -> Result<SessionState, PipelineError> {
+        let map = self.deltashots.read().await;
+        let mut rebuilt = SessionState::default();
+        for id in deltashot_ids {
+            let ds = map.get(id).ok_or_else(|| {
+                PipelineError::NotFound(format!("deltashot '{}' not found during replay", id))
+            })?;
+            if ds.event_type == EVENT_TYPE_STATE_UPDATE || ds.event_type == "ROLLBACK" {
+                apply_diff_to_state(&mut rebuilt, &ds.diff);
+            }
+        }
+        Ok(rebuilt)
     }
 
     fn next_id(&self, prefix: &str) -> String {
@@ -1598,10 +1814,8 @@ fn run_agent(
         || lower.contains("code")
         || matches!(mode, MessageMode::Execution)
     {
-        (
-            Some("code".to_owned()),
-            Some(format!("artifact payload for '{input}'")),
-        )
+        let rendered = render_artifact_content("code", input);
+        (Some("code".to_owned()), Some(rendered))
     } else {
         (None, None)
     };
@@ -1621,6 +1835,12 @@ fn estimate_complexity(input: &str) -> &'static str {
         13..=35 => "medium",
         _ => "high",
     }
+}
+
+fn render_artifact_content(artifact_type: &str, source: &str) -> String {
+    format!(
+        "{{\"type\":\"{artifact_type}\",\"rendered_from\":\"{source}\",\"engine\":\"deterministic\"}}"
+    )
 }
 
 fn apply_state_mutation(
@@ -1674,6 +1894,58 @@ fn compute_diff(prev: &SessionState, next: &SessionState) -> Value {
         "type": EVENT_TYPE_STATE_UPDATE,
         "changes": changes,
     })
+}
+
+fn apply_diff_to_state(state: &mut SessionState, diff: &Value) {
+    let changes = diff
+        .get("changes")
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    for (field, payload) in changes {
+        let to_value = payload
+            .get("to")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        match field.as_str() {
+            "goal" => {
+                state.goal = if to_value.is_empty() {
+                    None
+                } else {
+                    Some(to_value)
+                }
+            }
+            "step" => {
+                state.step = if to_value.is_empty() {
+                    None
+                } else {
+                    Some(to_value)
+                }
+            }
+            "last_user_message" => {
+                state.last_user_message = if to_value.is_empty() {
+                    None
+                } else {
+                    Some(to_value)
+                }
+            }
+            "last_agent_message" => {
+                state.last_agent_message = if to_value.is_empty() {
+                    None
+                } else {
+                    Some(to_value)
+                }
+            }
+            "version" => {
+                if let Ok(parsed) = to_value.parse::<u64>() {
+                    state.version = parsed;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn maybe_insert_change(

@@ -55,6 +55,7 @@ pub fn router() -> Router<Arc<PipelineState>> {
             get(get_artifact_version),
         )
         .route("/workflows/start", post(start_workflow))
+        .route("/workflows/execute-next", post(execute_next_workflow_job))
         .route("/workflows/{workflowId}/state", get(get_workflow_state))
         .route("/workflows/{workflowId}/step", post(advance_workflow_step))
         .route("/sessions/{sessionId}/agent", post(force_agent_selection))
@@ -225,6 +226,15 @@ async fn start_workflow(
     Json(request): Json<WorkflowStartRequest>,
 ) -> impl IntoResponse {
     with_meta(async move { state.start_workflow(request).await }).await
+}
+
+async fn execute_next_workflow_job(State(state): State<Arc<PipelineState>>) -> impl IntoResponse {
+    with_meta(async move {
+        state.execute_next_workflow_job().await?.ok_or_else(|| {
+            PipelineError::NotFound("no workflow job available for execution".to_owned())
+        })
+    })
+    .await
 }
 
 async fn get_workflow_state(
