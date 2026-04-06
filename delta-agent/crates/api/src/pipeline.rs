@@ -2766,13 +2766,6 @@ fn active_branch_mut(session: &mut SessionRecord) -> Result<&mut BranchRecord, P
         .ok_or_else(|| PipelineError::Internal("active branch missing".to_owned()))
 }
 
-fn active_branch(session: &SessionRecord) -> Result<&BranchRecord, PipelineError> {
-    session
-        .branches
-        .get(&session.active_branch_id)
-        .ok_or_else(|| PipelineError::Internal("active branch missing".to_owned()))
-}
-
 fn sync_active_branch_from_session(session: &mut SessionRecord) {
     let snapshot_state = session.state.clone();
     let snapshot_messages = session.messages.clone();
