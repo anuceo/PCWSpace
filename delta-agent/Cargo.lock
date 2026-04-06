@@ -45,6 +45,7 @@ dependencies = [
  "axum",
  "blake3",
  "delta-core",
+ "deltashot",
  "futures-util",
  "serde",
  "serde_json",
@@ -263,8 +264,11 @@ dependencies = [
 name = "deltashot"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "blake3",
  "delta-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

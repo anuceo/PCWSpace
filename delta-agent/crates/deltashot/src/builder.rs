@@ -1,26 +1,26 @@
-use crate::diff::structured_diff;
-use crate::ops::DeltaOp;
+use crate::diff::compute_diff_ops;
+use crate::ops::Op;
 
 #[derive(Default)]
 pub struct DeltaShotBuilder {
-    base: String,
-    next: String,
+    base: serde_json::Value,
+    next: serde_json::Value,
 }
 
 impl DeltaShotBuilder {
-    pub fn new(base: impl Into<String>) -> Self {
+    pub fn new(base: serde_json::Value) -> Self {
         Self {
-            base: base.into(),
-            next: String::new(),
+            base,
+            next: serde_json::Value::Null,
         }
     }
 
-    pub fn next(mut self, value: impl Into<String>) -> Self {
-        self.next = value.into();
+    pub fn next(mut self, value: serde_json::Value) -> Self {
+        self.next = value;
         self
     }
 
-    pub fn build(self) -> Vec<DeltaOp> {
-        structured_diff(&self.base, &self.next)
+    pub fn build(self) -> Vec<Op> {
+        compute_diff_ops(&self.base, &self.next)
     }
 }
