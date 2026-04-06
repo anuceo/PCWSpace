@@ -1,97 +1,78 @@
 use std::collections::BTreeSet;
 
-use serde_json::{Map, Value};
+use anyhow::Result;
+use serde_json::Value;
 
 use crate::ops::{Op, OpType};
 
-pub fn compute_diff_ops(before: &Value, after: &Value) -> Vec<Op> {
+pub fn compute_diff_ops(prev: &Value, next: &Value) -> Result<Vec<Op>> {
     let mut ops = Vec::new();
-    diff_values("", before, after, &mut ops);
-    ops
+    diff_recursive("root", prev, next, &mut ops)?;
+    ops.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(ops)
 }
 
-fn diff_values(path: &str, before: &Value, after: &Value, ops: &mut Vec<Op>) {
-    match (before, after) {
-        (Value::Object(before_map), Value::Object(after_map)) => {
-            diff_objects(path, before_map, after_map, ops);
-        }
-        (Value::Array(before_items), Value::Array(after_items)) => {
-            if before_items != after_items {
-                if path.is_empty() {
-                    ops.push(Op::new(
-                        path.to_owned(),
-                        OpType::Replace,
-                        Some(Value::Array(after_items.clone())),
-                    ));
-                } else if before_items.len() < after_items.len()
-                    && before_items == &after_items[..before_items.len()]
-                {
-                    for item in after_items.iter().skip(before_items.len()) {
-                        ops.push(Op::new(path.to_owned(), OpType::Append, Some(item.clone())));
-                    }
-                } else {
-                    ops.push(Op::new(
-                        path.to_owned(),
-                        OpType::Replace,
-                        Some(Value::Array(after_items.clone())),
-                    ));
+fn diff_recursive(path: &str, prev: &Value, next: &Value, ops: &mut Vec<Op>) -> Result<()> {
+    match (prev, next) {
+        (Value::Object(prev_map), Value::Object(next_map)) => {
+            // Deletions
+            for key in prev_map.keys() {
+                if !next_map.contains_key(key) {
+                    ops.push(Op::new(format!("{path}.{}", key), OpType::Delete, None));
+                }
+            }
+
+            // Additions + updates
+            let ordered = next_map.keys().cloned().collect::<BTreeSet<_>>();
+            for key in ordered {
+                let next_val = next_map
+                    .get(&key)
+                    .expect("ordered keys sourced from same map");
+                let new_path = format!("{path}.{key}");
+                match prev_map.get(&key) {
+                    None => ops.push(Op::new(new_path, OpType::Set, Some(next_val.clone()))),
+                    Some(prev_val) => diff_recursive(&new_path, prev_val, next_val, ops)?,
                 }
             }
         }
+        (Value::Array(prev_arr), Value::Array(next_arr)) => {
+            handle_array_diff(path, prev_arr, next_arr, ops)?;
+        }
         _ => {
-            if before != after {
-                let op = if before.is_null() {
-                    OpType::Set
-                } else {
-                    OpType::Replace
-                };
-                ops.push(Op::new(path.to_owned(), op, Some(after.clone())));
+            if prev != next {
+                ops.push(Op::new(
+                    path.to_owned(),
+                    OpType::Replace,
+                    Some(next.clone()),
+                ));
             }
         }
     }
+    Ok(())
 }
 
-fn diff_objects(
-    path: &str,
-    before: &Map<String, Value>,
-    after: &Map<String, Value>,
-    ops: &mut Vec<Op>,
-) {
-    let mut keys = BTreeSet::new();
-    for key in before.keys() {
-        keys.insert(key.clone());
-    }
-    for key in after.keys() {
-        keys.insert(key.clone());
+fn handle_array_diff(path: &str, prev: &[Value], next: &[Value], ops: &mut Vec<Op>) -> Result<()> {
+    let min_len = prev.len().min(next.len());
+
+    for i in 0..min_len {
+        diff_recursive(&format!("{path}[{i}]"), &prev[i], &next[i], ops)?;
     }
 
-    for key in keys {
-        let next_path = join_path(path, &key);
-        match (before.get(&key), after.get(&key)) {
-            (Some(previous), Some(current)) => {
-                diff_values(&next_path, previous, current, ops);
-            }
-            (None, Some(current)) => {
-                ops.push(Op::new(next_path, OpType::Set, Some(current.clone())));
-            }
-            (Some(_), None) => {
-                ops.push(Op::new(next_path, OpType::Delete, None));
-            }
-            (None, None) => {}
+    if next.len() > prev.len() {
+        for item in next.iter().skip(prev.len()) {
+            ops.push(Op::new(path.to_owned(), OpType::Append, Some(item.clone())));
         }
     }
-}
 
-fn join_path(parent: &str, key: &str) -> String {
-    if parent.is_empty() {
-        format!("/{}", escape_json_pointer(key))
-    } else {
-        format!("{}/{}", parent, escape_json_pointer(key))
+    if prev.len() > next.len() {
+        ops.push(Op::new(
+            path.to_owned(),
+            OpType::Replace,
+            Some(Value::Array(next.to_vec())),
+        ));
     }
-}
 
-fn escape_json_pointer(segment: &str) -> String {
-    segment.replace('~', "~0").replace('/', "~1")
+    Ok(())
 }
 
 #[cfg(test)]
@@ -99,37 +80,51 @@ mod tests {
     use serde_json::json;
 
     use super::compute_diff_ops;
+    use crate::apply::apply_ops_to_state;
     use crate::ops::OpType;
 
     #[test]
     fn computes_nested_set_replace_and_delete_ops() {
         let before = json!({
-            "goal": "draft",
-            "summary": {
-                "step": "draft",
-                "owner": "agent"
+            "a": 1,
+            "obj": {
+                "x": "old",
+                "y": 1
             }
         });
         let after = json!({
-            "goal": "final",
-            "summary": {
-                "step": "refine"
+            "a": 2,
+            "obj": {
+                "x": "new"
             },
-            "version": 2
+            "b": 3
         });
 
-        let ops = compute_diff_ops(&before, &after);
+        let ops = compute_diff_ops(&before, &after).expect("diff should work");
         assert!(ops
             .iter()
-            .any(|op| op.path == "/goal" && op.op_type == OpType::Replace));
+            .any(|op| op.path == "root.a" && op.op_type == OpType::Replace));
         assert!(ops
             .iter()
-            .any(|op| op.path == "/summary/step" && op.op_type == OpType::Replace));
+            .any(|op| op.path == "root.obj.x" && op.op_type == OpType::Replace));
         assert!(ops
             .iter()
-            .any(|op| op.path == "/summary/owner" && op.op_type == OpType::Delete));
+            .any(|op| op.path == "root.obj.y" && op.op_type == OpType::Delete));
         assert!(ops
             .iter()
-            .any(|op| op.path == "/version" && op.op_type == OpType::Set));
+            .any(|op| op.path == "root.b" && op.op_type == OpType::Set));
+    }
+
+    #[test]
+    fn test_diff_and_apply() {
+        let prev = json!({"a": 1});
+        let next = json!({"a": 2, "b": 3});
+
+        let ops = compute_diff_ops(&prev, &next).expect("diff should compute");
+
+        let mut state = prev.clone();
+        state = apply_ops_to_state(&state, &ops).expect("ops should apply");
+
+        assert_eq!(state, next);
     }
 }

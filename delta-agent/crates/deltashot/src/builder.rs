@@ -21,6 +21,6 @@ impl DeltaShotBuilder {
     }
 
     pub fn build(self) -> Vec<Op> {
-        compute_diff_ops(&self.base, &self.next)
+        compute_diff_ops(&self.base, &self.next).unwrap_or_default()
     }
 }

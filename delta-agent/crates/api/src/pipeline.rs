@@ -2660,7 +2660,7 @@ fn apply_state_mutation(
 fn state_ops_from_states(prev: &SessionState, next: &SessionState) -> Vec<DeltaShotOp> {
     let prev_value = value_from_state(prev);
     let next_value = value_from_state(next);
-    compute_diff_ops(&prev_value, &next_value)
+    compute_diff_ops(&prev_value, &next_value).unwrap_or_default()
 }
 
 fn ops_to_diff_value(ops: &[DeltaShotOp]) -> Value {

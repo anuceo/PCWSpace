@@ -9,7 +9,7 @@ use crate::ops::{canonical_serialize_ops, DeltaShot, Op};
 pub struct DeltaShotEngine;
 
 impl DeltaShotEngine {
-    pub fn build_delta(&self, base: &Value, next: &Value) -> Vec<Op> {
+    pub fn build_delta(&self, base: &Value, next: &Value) -> Result<Vec<Op>> {
         compute_diff_ops(base, next)
     }
 
