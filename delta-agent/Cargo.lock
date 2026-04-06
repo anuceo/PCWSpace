@@ -43,11 +43,15 @@ name = "api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "blake3",
  "delta-core",
  "serde",
  "serde_json",
  "streaming",
+ "thiserror",
  "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -859,6 +863,7 @@ dependencies = [
  "anyhow",
  "api",
  "axum",
+ "delta-core",
  "serde",
  "tokio",
  "toml",

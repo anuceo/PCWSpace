@@ -47,6 +47,22 @@ Health route examples:
 - `GET /sessions/{id}`
 - `GET /branches/{id}`
 - `GET /streaming/ping`
+- `POST /sessions/{id}/message`
+
+Deterministic request lifecycle for `POST /sessions/{id}/message`:
+
+1. hydrate session state + recent messages
+2. acquire session lock
+3. append user message
+4. route + run agent
+5. apply state mutation + compute diff
+6. write DeltaShot + hash chain
+7. upsert artifact metadata (if produced)
+8. append agent response
+9. persist updated state
+10. enqueue workflow continuation
+11. enqueue async Notion sync job
+12. release lock and respond
 
 ## Run worker
 

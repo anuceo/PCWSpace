@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use axum::{extract::Path, routing::get, Json, Router};
 use serde::Serialize;
+
+use crate::pipeline::PipelineState;
 
 #[derive(Debug, Serialize)]
 struct BranchResponse {
@@ -7,7 +11,7 @@ struct BranchResponse {
     queue_depth: usize,
 }
 
-pub fn router() -> Router {
+pub fn router() -> Router<Arc<PipelineState>> {
     Router::new().route("/branches/{id}", get(get_branch))
 }
 
