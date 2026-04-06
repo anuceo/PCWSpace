@@ -2,23 +2,25 @@
 
 Base path: `/api/v1`
 
-This contract is deterministic, session-scoped, and replay-aware.
+This API is a command interface over a temporal execution engine. It is deterministic, session-scoped, replayable through DeltaShots, and version-safe for state/artifacts.
 
-## Design guarantees
+## API design principles
 
-1. All core mutations are session-scoped.
-2. Every stateful mutation returns a DeltaShot reference.
-3. Async workflow execution is first-class.
-4. State transitions are explicit and versioned.
-5. Artifacts are versioned, never overwritten.
+1. Everything is session-scoped.
+2. Every state mutation returns a DeltaShot reference.
+3. Async operations (workflow queue + streaming) are first-class.
+4. State is versioned and never blindly overwritten.
+5. Artifacts are versioned, not replaced.
 
-## Global response shape
+## Global response contract
 
-Successful responses include payload fields at top level plus:
+### Success envelope
+
+Object responses:
 
 ```json
 {
-  "...payload fields": "...",
+  "...payload_fields": "...",
   "meta": {
     "request_id": "req_123",
     "timestamp": 1775453669005,
@@ -27,13 +29,26 @@ Successful responses include payload fields at top level plus:
 }
 ```
 
-Errors:
+Collection responses emitted by the runtime are wrapped as:
+
+```json
+{
+  "value": [],
+  "meta": {
+    "request_id": "req_123",
+    "timestamp": 1775453669005,
+    "latency_ms": 12
+  }
+}
+```
+
+### Error envelope
 
 ```json
 {
   "error": {
     "code": "SESSION_LOCKED",
-    "message": "session lock unavailable",
+    "message": "Session is currently locked",
     "retryable": true
   },
   "meta": {
@@ -44,54 +59,67 @@ Errors:
 }
 ```
 
-## Endpoints
+---
 
-### Workspaces
+## 1) Workspace API
 
 - `POST /workspaces`
 - `GET /workspaces/{workspaceId}`
 - `GET /workspaces/{workspaceId}/sessions?limit=20&cursor=<timestamp>`
 
-### Sessions
+Create workspace request:
+
+```json
+{
+  "name": "OneManBusinessOS"
+}
+```
+
+Create workspace response:
+
+```json
+{
+  "workspace_id": "ws_123",
+  "created_at": 1775453669005,
+  "meta": {
+    "request_id": "req_123",
+    "timestamp": 1775453669005,
+    "latency_ms": 12
+  }
+}
+```
+
+---
+
+## 2) Session API (core interaction)
 
 - `POST /sessions`
-- `POST /sessions/{sessionId}/messages`
+- `POST /sessions/{sessionId}/messages` (primary entrypoint)
 - `GET /sessions/{sessionId}/state`
 - `GET /sessions/{sessionId}/messages?limit=50&cursor=<message_id>`
 
-### DeltaShots
+Create session request:
 
-- `GET /sessions/{sessionId}/deltashots`
-- `GET /deltashots/{deltashotId}`
-- `POST /sessions/{sessionId}/rollback`
+```json
+{
+  "workspace_id": "ws_123",
+  "name": "Landing Page Build"
+}
+```
 
-### Artifacts
+Primary deterministic mutation request:
 
-- `POST /artifacts`
-- `GET /artifacts/{artifactId}`
-- `GET /artifacts/{artifactId}/versions`
-- `GET /artifacts/{artifactId}/versions/{version}`
+```json
+{
+  "content": "Create a landing page for my product",
+  "mode": "chat",
+  "metadata": {
+    "priority": "normal"
+  }
+}
+```
 
-### Workflows
-
-- `POST /workflows/start`
-- `POST /workflows/execute-next`
-- `GET /workflows/{workflowId}/state`
-- `POST /workflows/{workflowId}/step`
-
-### Agent Control
-
-- `POST /sessions/{sessionId}/agent`
-- `GET /sessions/{sessionId}/agents/logs`
-
-### System / Debug
-
-- `GET /sessions/{sessionId}/trace`
-- `GET /health`
-
-## Deterministic primary mutation response
-
-`POST /sessions/{sessionId}/messages`
+Primary deterministic mutation response:
 
 ```json
 {
@@ -129,3 +157,221 @@ Errors:
   }
 }
 ```
+
+---
+
+## 3) DeltaShots API (time control)
+
+- `GET /sessions/{sessionId}/deltashots`
+- `GET /deltashots/{deltashotId}`
+- `POST /sessions/{sessionId}/rollback`
+
+DeltaShot detail response:
+
+```json
+{
+  "id": "ds_001",
+  "timestamp": 1775453669005,
+  "type": "STATE_UPDATE",
+  "diff": {},
+  "hash": "abc...",
+  "prev_hash": "def...",
+  "meta": {
+    "request_id": "req_123",
+    "timestamp": 1775453669005,
+    "latency_ms": 12
+  }
+}
+```
+
+Rollback request:
+
+```json
+{
+  "target_deltashot_id": "ds_0007",
+  "mode": "hard"
+}
+```
+
+Rollback response:
+
+```json
+{
+  "status": "rolled_back",
+  "current_state_version": 8,
+  "new_deltashot_id": "ds_rollback_01",
+  "meta": {
+    "request_id": "req_123",
+    "timestamp": 1775453669005,
+    "latency_ms": 12
+  }
+}
+```
+
+---
+
+## 4) Artifact API (live outputs)
+
+- `POST /artifacts`
+- `GET /artifacts/{artifactId}`
+- `GET /artifacts/{artifactId}/versions`
+- `GET /artifacts/{artifactId}/versions/{version}`
+
+Artifact write request:
+
+```json
+{
+  "session_id": "sess_456",
+  "type": "code",
+  "content": "...",
+  "metadata": {
+    "label": "Landing Page HTML"
+  }
+}
+```
+
+---
+
+## 5) Workflow API (automation layer)
+
+- `POST /workflows/start`
+- `POST /workflows/execute-next`
+- `GET /workflows/{workflowId}/state`
+- `POST /workflows/{workflowId}/step`
+
+Workflow start request:
+
+```json
+{
+  "session_id": "sess_456",
+  "workflow_id": "client_outreach",
+  "input": {
+    "target": "SaaS founders"
+  }
+}
+```
+
+---
+
+## 6) Agent control API
+
+- `POST /sessions/{sessionId}/agent`
+- `GET /sessions/{sessionId}/agents/logs`
+
+Force agent request:
+
+```json
+{
+  "agent": "claude",
+  "reason": "force reasoning model"
+}
+```
+
+---
+
+## 7) System / debug API
+
+- `GET /sessions/{sessionId}/trace`
+- `GET /health`
+
+Execution trace response shape:
+
+```json
+{
+  "messages": [],
+  "deltashots": [],
+  "state_transitions": [],
+  "artifacts": [],
+  "meta": {
+    "request_id": "req_123",
+    "timestamp": 1775453669005,
+    "latency_ms": 12
+  }
+}
+```
+
+---
+
+## 8) Branching API (temporal forking extension)
+
+- `POST /sessions/{sessionId}/branch`
+- `GET /sessions/{sessionId}/branches`
+- `POST /sessions/{sessionId}/branch/switch`
+- `POST /sessions/{sessionId}/branch/merge`
+
+Create branch request:
+
+```json
+{
+  "from_deltashot_id": "ds_010",
+  "label": "Try aggressive marketing angle",
+  "mode": "soft"
+}
+```
+
+Create branch response:
+
+```json
+{
+  "branch": {
+    "branch_id": "br_789",
+    "parent_deltashot_id": "ds_010",
+    "created_at": 1775453669005
+  },
+  "state": {
+    "version": 10,
+    "forked": true
+  },
+  "meta": {
+    "request_id": "req_123",
+    "timestamp": 1775453669005,
+    "latency_ms": 12
+  }
+}
+```
+
+### Branching invariant
+
+A branch never mutates another branch's event stream.
+
+---
+
+## 9) Streaming API (real-time execution extension)
+
+- `POST /sessions/{sessionId}/messages/stream`
+- Header: `Idempotency-Key: req_123` (optional, supported)
+- Response content type: `text/event-stream`
+
+Request:
+
+```json
+{
+  "content": "Build me a landing page",
+  "mode": "execution",
+  "stream": true,
+  "branch": "br_789"
+}
+```
+
+SSE event contract:
+
+1. `ack` -> `{"request_id":"req_123"}`
+2. `token` -> `{"delta":"Here","accumulated":"Here"}`
+3. `message` -> `{"message_id":"msg_1","content":"..."}`
+4. `deltashot` -> `{"id":"ds_22","type":"STATE_UPDATE"}`
+5. `artifact` -> `{"artifact_id":"art_1","version":2,"type":"code"}`
+6. `workflow` -> `{"step":"refine","status":"started"}`
+7. `done` -> `{"status":"complete"}`
+8. `error` -> `{"code":"AGENT_FAILURE","retryable":true}`
+
+Streaming design requirements:
+
+- token stream is buffered; state commits only at completion
+- supports idempotent replay via `Idempotency-Key`
+- branch-aware execution via `branch` field
+
+---
+
+## Optional future extensions
+
+- `POST /sessions/{sessionId}/batch` (deterministic multi-command transaction)
