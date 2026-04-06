@@ -9,12 +9,11 @@ cd delta-agent
 ./scripts/setup.sh
 ```
 
-This validates:
+This prepares the environment by:
 
 - Rust toolchain presence (uses `rust-toolchain.toml`)
-- formatting (`cargo fmt --all --check`)
-- compile health (`cargo check --workspace`)
-- tests (`cargo test --workspace`)
+- dependency fetch (`cargo fetch --locked || cargo fetch`)
+- optional prewarm (`cargo check --workspace` + `cargo test --workspace --no-run`)
 
 ## Structure
 
@@ -45,8 +44,8 @@ Overrides:
 
 Health route examples:
 
-- `GET /sessions/:id`
-- `GET /branches/:id`
+- `GET /sessions/{id}`
+- `GET /branches/{id}`
 - `GET /streaming/ping`
 
 ## Run worker
@@ -60,3 +59,12 @@ Overrides:
 
 - `DELTA_AGENT_CONFIG` (default: `configs/default.toml`)
 - `RUST_LOG` (default: `worker=info`)
+
+## Cloud agent environment
+
+The repository root contains `.cursor/environment.json` to speed up and
+stabilize cloud-agent runs for this workspace:
+
+- uses stable Rust with `rustfmt` and `clippy`
+- prewarms `cargo check --workspace` + `cargo test --workspace --no-run`
+- persists Cargo/Rust caches and a shared Cargo target directory
