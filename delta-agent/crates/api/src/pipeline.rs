@@ -18,6 +18,7 @@ const SESSION_LOCK_TTL_SECS: u64 = 5;
 const SESSION_LOCK_RETRIES: usize = 3;
 const LOCK_RETRY_DELAY_MS: u64 = 40;
 const EVENT_TYPE_EXECUTION_STEP: &str = "EXECUTION_STEP";
+const MAIN_BRANCH_ID: &str = "br_main";
 
 static PIPELINE: OnceLock<ExecutionPipeline> = OnceLock::new();
 
@@ -125,6 +126,39 @@ fn default_workflow_step() -> String {
 pub struct ForceAgentRequest {
     pub agent: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchCreateRequest {
+    pub from_deltashot_id: String,
+    pub label: String,
+    #[serde(default)]
+    pub mode: BranchMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchSwitchRequest {
+    pub branch_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchMergeRequest {
+    pub source_branch: String,
+    pub target_branch: String,
+    pub strategy: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamMessageRequestV1 {
+    pub content: String,
+    #[serde(default)]
+    pub mode: MessageMode,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -331,6 +365,68 @@ pub struct HealthResponse {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchMode {
+    Soft,
+    Hard,
+}
+
+impl Default for BranchMode {
+    fn default() -> Self {
+        Self::Soft
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchCreateResponse {
+    pub branch: BranchPointer,
+    pub state: BranchStateView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchPointer {
+    pub branch_id: String,
+    pub parent_deltashot_id: String,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchStateView {
+    pub version: u64,
+    pub forked: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchListResponse {
+    pub branches: Vec<BranchSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchSummary {
+    pub branch_id: String,
+    pub is_main: bool,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchSwitchResponse {
+    pub branch_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchMergeResponse {
+    pub status: String,
+    pub new_deltashot_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamEventEnvelope {
+    pub event: String,
+    pub data: Value,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiResponseMeta {
     pub request_id: String,
@@ -355,6 +451,55 @@ pub struct ApiErrorBody {
 pub struct ApiErrorEnvelope {
     pub error: ApiErrorBody,
     pub meta: ApiResponseMeta,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamAckEvent {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamTokenEvent {
+    pub delta: String,
+    pub accumulated: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamMessageEvent {
+    pub message_id: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamDeltaShotEvent {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub event_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamArtifactEvent {
+    pub artifact_id: String,
+    pub version: u64,
+    #[serde(rename = "type")]
+    pub artifact_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamWorkflowEvent {
+    pub step: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamDoneEvent {
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamErrorEvent {
+    pub code: String,
+    pub retryable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -389,12 +534,14 @@ struct SessionRecord {
     hashchain: Vec<String>,
     deltashot_ids: Vec<String>,
     artifacts: HashSet<String>,
+    active_branch_id: String,
+    branches: HashMap<String, BranchRecord>,
     forced_agent: Option<ForcedAgent>,
 }
 
 impl SessionRecord {
     fn new(session_id: String, workspace_id: String, name: String) -> Self {
-        Self {
+        let mut record = Self {
             session_id,
             workspace_id,
             name,
@@ -407,9 +554,29 @@ impl SessionRecord {
             hashchain: Vec::new(),
             deltashot_ids: Vec::new(),
             artifacts: HashSet::new(),
+            active_branch_id: MAIN_BRANCH_ID.to_owned(),
+            branches: HashMap::new(),
             forced_agent: None,
-        }
+        };
+        sync_active_branch_from_session(&mut record);
+        record
     }
+}
+
+#[derive(Debug, Clone)]
+struct BranchRecord {
+    branch_id: String,
+    session_id: String,
+    parent_deltashot_id: String,
+    created_at: u64,
+    label: Option<String>,
+    mode: BranchMode,
+    state: SessionState,
+    messages: Vec<ChatMessage>,
+    events: Vec<SessionEvent>,
+    hashchain: Vec<String>,
+    deltashot_ids: Vec<String>,
+    artifacts: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,6 +611,7 @@ struct DeltashotRecord {
 struct ArtifactRecord {
     artifact_id: String,
     session_id: String,
+    branch_id: String,
     artifact_type: String,
     created_at: u64,
     current_version: u64,
@@ -524,6 +692,7 @@ pub struct ExecutionPipeline {
     agent_logs: RwLock<HashMap<String, Vec<AgentLogEntry>>>,
     notion_queue: Arc<Mutex<Vec<NotionSyncJob>>>,
     locks: Mutex<HashMap<String, Instant>>,
+    idempotent_streams: Mutex<HashMap<String, Vec<StreamEventEnvelope>>>,
 }
 
 pub type PipelineState = ExecutionPipeline;
@@ -548,6 +717,7 @@ impl ExecutionPipeline {
             agent_logs: RwLock::new(HashMap::new()),
             notion_queue: Arc::new(Mutex::new(Vec::new())),
             locks: Mutex::new(HashMap::new()),
+            idempotent_streams: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1065,12 +1235,14 @@ impl ExecutionPipeline {
                     "Adhoc Session".to_owned(),
                 )
             });
+            ensure_session_branches(session);
             session.state = rebuilt_state.clone();
 
             if mode == "hard" {
                 session.deltashot_ids.truncate(target_index + 1);
                 session.hashchain.truncate(target_index + 1);
             }
+            sync_active_branch_from_session(session);
 
             drop(sessions);
 
@@ -1389,6 +1561,496 @@ impl ExecutionPipeline {
         }
     }
 
+    pub async fn create_branch(
+        &self,
+        session_id: &str,
+        request: BranchCreateRequest,
+    ) -> Result<BranchCreateResponse, PipelineError> {
+        if request.label.trim().is_empty() {
+            return Err(PipelineError::InvalidInput(
+                "branch label cannot be empty".to_owned(),
+            ));
+        }
+
+        let (source_branch, source_idx) = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions.get_mut(session_id).ok_or_else(|| {
+                PipelineError::NotFound(format!("session '{}' not found", session_id))
+            })?;
+            ensure_session_branches(session);
+            let mut source = None;
+            for branch in session.branches.values() {
+                if let Some(idx) = branch
+                    .deltashot_ids
+                    .iter()
+                    .position(|id| id == &request.from_deltashot_id)
+                {
+                    source = Some((branch.clone(), idx));
+                    break;
+                }
+            }
+            source.ok_or_else(|| {
+                PipelineError::NotFound(format!(
+                    "deltashot '{}' not found in any branch",
+                    request.from_deltashot_id
+                ))
+            })?
+        };
+
+        let parent_snapshot = {
+            let map = self.deltashots.read().await;
+            map.get(&request.from_deltashot_id)
+                .map(|record| (record.state_snapshot.clone(), record.timestamp))
+                .ok_or_else(|| {
+                    PipelineError::NotFound(format!(
+                        "deltashot '{}' not found",
+                        request.from_deltashot_id
+                    ))
+                })?
+        };
+
+        let branch_id = self.next_id("br");
+        let mut branch_artifacts = source_branch.artifacts.clone();
+        if matches!(request.mode, BranchMode::Hard) {
+            let mut artifacts = self.artifacts.write().await;
+            let mut duplicated = HashSet::new();
+            for source_artifact_id in &source_branch.artifacts {
+                let Some(record) = artifacts.get(source_artifact_id).cloned() else {
+                    continue;
+                };
+                let duplicated_id = self.next_id("art");
+                let mut cloned = record.clone();
+                cloned.artifact_id = duplicated_id.clone();
+                cloned.branch_id = branch_id.clone();
+                cloned.session_id = session_id.to_owned();
+                artifacts.insert(duplicated_id.clone(), cloned);
+                duplicated.insert(duplicated_id);
+            }
+            branch_artifacts = duplicated;
+        }
+
+        let hashchain_cutoff = source_idx
+            .saturating_add(1)
+            .min(source_branch.hashchain.len());
+        let parent_state = parent_snapshot.0;
+        let parent_timestamp = parent_snapshot.1;
+        let new_branch = BranchRecord {
+            branch_id: branch_id.clone(),
+            session_id: session_id.to_owned(),
+            parent_deltashot_id: request.from_deltashot_id.clone(),
+            created_at: now_ms(),
+            label: Some(request.label),
+            mode: request.mode.clone(),
+            state: parent_state.clone(),
+            messages: source_branch
+                .messages
+                .iter()
+                .filter(|message| message.timestamp <= parent_timestamp)
+                .cloned()
+                .collect::<Vec<_>>(),
+            events: source_branch
+                .events
+                .iter()
+                .filter(|event| event.timestamp <= parent_timestamp)
+                .cloned()
+                .collect::<Vec<_>>(),
+            hashchain: source_branch.hashchain[..hashchain_cutoff].to_vec(),
+            deltashot_ids: source_branch.deltashot_ids[..=source_idx].to_vec(),
+            artifacts: branch_artifacts,
+        };
+
+        {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions.get_mut(session_id).ok_or_else(|| {
+                PipelineError::NotFound(format!("session '{}' not found", session_id))
+            })?;
+            ensure_session_branches(session);
+            session.branches.insert(branch_id.clone(), new_branch);
+        }
+
+        Ok(BranchCreateResponse {
+            branch: BranchPointer {
+                branch_id,
+                parent_deltashot_id: request.from_deltashot_id,
+                created_at: now_ms(),
+            },
+            state: BranchStateView {
+                version: parent_state.version,
+                forked: true,
+            },
+        })
+    }
+
+    pub async fn list_branches(
+        &self,
+        session_id: &str,
+    ) -> Result<BranchListResponse, PipelineError> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            PipelineError::NotFound(format!("session '{}' not found", session_id))
+        })?;
+        ensure_session_branches(session);
+
+        let mut branches = session
+            .branches
+            .values()
+            .map(|branch| BranchSummary {
+                branch_id: branch.branch_id.clone(),
+                is_main: branch.branch_id == MAIN_BRANCH_ID,
+                label: branch.label.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        branches.sort_by(|a, b| a.branch_id.cmp(&b.branch_id));
+        branches.sort_by(|a, b| b.is_main.cmp(&a.is_main));
+
+        Ok(BranchListResponse { branches })
+    }
+
+    pub async fn switch_branch(
+        &self,
+        session_id: &str,
+        request: BranchSwitchRequest,
+    ) -> Result<BranchSwitchResponse, PipelineError> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            PipelineError::NotFound(format!("session '{}' not found", session_id))
+        })?;
+        ensure_session_branches(session);
+        load_branch_into_session(session, &request.branch_id)?;
+
+        Ok(BranchSwitchResponse {
+            branch_id: request.branch_id,
+            status: "switched".to_owned(),
+        })
+    }
+
+    pub async fn merge_branch(
+        &self,
+        session_id: &str,
+        request: BranchMergeRequest,
+    ) -> Result<BranchMergeResponse, PipelineError> {
+        let strategy = request.strategy.to_ascii_lowercase();
+        if strategy != "fast-forward" && strategy != "rebase" && strategy != "manual" {
+            return Err(PipelineError::InvalidInput(
+                "strategy must be one of: fast-forward | rebase | manual".to_owned(),
+            ));
+        }
+
+        let merge_record = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions.get_mut(session_id).ok_or_else(|| {
+                PipelineError::NotFound(format!("session '{}' not found", session_id))
+            })?;
+            ensure_session_branches(session);
+
+            let source = session
+                .branches
+                .get(&request.source_branch)
+                .cloned()
+                .ok_or_else(|| {
+                    PipelineError::NotFound(format!(
+                        "source branch '{}' not found",
+                        request.source_branch
+                    ))
+                })?;
+            let target = session
+                .branches
+                .get(&request.target_branch)
+                .cloned()
+                .ok_or_else(|| {
+                    PipelineError::NotFound(format!(
+                        "target branch '{}' not found",
+                        request.target_branch
+                    ))
+                })?;
+
+            let merge_diff = compute_diff(&target.state, &source.state);
+            let new_deltashot_id = self.next_id("ds_merge");
+            let prev_hash = target.hashchain.last().cloned();
+            let digest_input = serde_json::json!({
+                "id": new_deltashot_id,
+                "session_id": session_id,
+                "event_type": "BRANCH_MERGE",
+                "strategy": strategy,
+                "source": request.source_branch,
+                "target": request.target_branch,
+                "diff": merge_diff,
+                "prev_hash": prev_hash,
+            });
+            let encoded = serde_json::to_vec(&digest_input)
+                .map_err(|err| PipelineError::Serialization(err.to_string()))?;
+            let hash = blake3::hash(&encoded).to_hex().to_string();
+
+            let merge_event = SessionEvent {
+                id: self.next_id("evt"),
+                event_type: "BRANCH_MERGE".to_owned(),
+                payload: serde_json::json!({
+                    "source_branch": request.source_branch,
+                    "target_branch": request.target_branch,
+                    "strategy": strategy,
+                }),
+                timestamp: now_ms(),
+            };
+
+            let mut merged_target = target;
+            merged_target.mode = BranchMode::Soft;
+            merged_target.state = source.state.clone();
+            merged_target.messages = source.messages.clone();
+            merged_target.events.push(merge_event);
+            merged_target.hashchain.push(hash.clone());
+            merged_target.deltashot_ids.push(new_deltashot_id.clone());
+            merged_target.artifacts = source.artifacts.clone();
+            session
+                .branches
+                .insert(request.target_branch.clone(), merged_target);
+
+            if session.active_branch_id == request.target_branch {
+                load_branch_into_session(session, &request.target_branch)?;
+            }
+
+            DeltashotRecord {
+                id: new_deltashot_id,
+                session_id: session_id.to_owned(),
+                timestamp: now_ms(),
+                event_type: EVENT_TYPE_STATE_UPDATE.to_owned(),
+                diff: merge_diff,
+                hash,
+                prev_hash,
+                state_snapshot: source.state,
+            }
+        };
+
+        {
+            let mut deltashots = self.deltashots.write().await;
+            deltashots.insert(merge_record.id.clone(), merge_record.clone());
+        }
+
+        Ok(BranchMergeResponse {
+            status: "merged".to_owned(),
+            new_deltashot_id: merge_record.id,
+        })
+    }
+
+    pub async fn stream_message_v1(
+        &self,
+        session_id: &str,
+        request: StreamMessageRequestV1,
+        idempotency_key: Option<String>,
+    ) -> Vec<StreamEventEnvelope> {
+        let cache_key = idempotency_key
+            .as_ref()
+            .map(|key| format!("{session_id}:{key}"));
+        if let Some(key) = cache_key.as_ref() {
+            let cache = self.idempotent_streams.lock().await;
+            if let Some(cached) = cache.get(key) {
+                return cached.clone();
+            }
+        }
+
+        let request_id = idempotency_key
+            .clone()
+            .unwrap_or_else(|| format!("req_{}", uuid::Uuid::new_v4().simple()));
+        let mut events = vec![stream_event("ack", StreamAckEvent { request_id })];
+
+        if request.content.trim().is_empty() {
+            events.push(stream_event(
+                "error",
+                StreamErrorEvent {
+                    code: PipelineError::InvalidInput("message content cannot be empty".to_owned())
+                        .code()
+                        .to_owned(),
+                    retryable: false,
+                },
+            ));
+            if let Some(key) = cache_key {
+                let mut cache = self.idempotent_streams.lock().await;
+                cache.insert(key, events.clone());
+            }
+            return events;
+        }
+
+        if let Some(branch_id) = request.branch.clone() {
+            if let Err(error) = self
+                .switch_branch(session_id, BranchSwitchRequest { branch_id })
+                .await
+            {
+                events.push(stream_event(
+                    "error",
+                    StreamErrorEvent {
+                        code: error.code().to_owned(),
+                        retryable: error.retryable(),
+                    },
+                ));
+                if let Some(key) = cache_key {
+                    let mut cache = self.idempotent_streams.lock().await;
+                    cache.insert(key, events.clone());
+                }
+                return events;
+            }
+        }
+
+        let lock_key = match self.acquire_session_lock(session_id).await {
+            Ok(key) => key,
+            Err(error) => {
+                events.push(stream_event(
+                    "error",
+                    StreamErrorEvent {
+                        code: error.code().to_owned(),
+                        retryable: error.retryable(),
+                    },
+                ));
+                if let Some(key) = cache_key {
+                    let mut cache = self.idempotent_streams.lock().await;
+                    cache.insert(key, events.clone());
+                }
+                return events;
+            }
+        };
+
+        let result = self
+            .run_locked_stream_pipeline(session_id, request, &mut events)
+            .await;
+        self.release_lock(&lock_key).await;
+
+        match result {
+            Ok(_) => events.push(stream_event(
+                "done",
+                StreamDoneEvent {
+                    status: "complete".to_owned(),
+                },
+            )),
+            Err(error) => events.push(stream_event(
+                "error",
+                StreamErrorEvent {
+                    code: error.code().to_owned(),
+                    retryable: error.retryable(),
+                },
+            )),
+        }
+
+        if let Some(key) = cache_key {
+            let mut cache = self.idempotent_streams.lock().await;
+            cache.insert(key, events.clone());
+        }
+        events
+    }
+
+    async fn run_locked_stream_pipeline(
+        &self,
+        session_id: &str,
+        request: StreamMessageRequestV1,
+        events: &mut Vec<StreamEventEnvelope>,
+    ) -> Result<(), PipelineError> {
+        let context = self.hydrate_context(session_id).await;
+        let _ = self
+            .append_message(session_id, "user", &request.content)
+            .await?;
+
+        let (agent, reason) = select_agent(
+            &request.content,
+            &request.mode,
+            context.forced_agent.as_ref(),
+        );
+        self.append_agent_log(session_id, &agent, &reason).await;
+
+        let agent_output = run_agent(agent, &request.content, &context, &request.mode);
+        let mut accumulated = String::new();
+        for token in tokenize_stream_chunks(&agent_output.text) {
+            if !accumulated.is_empty() {
+                accumulated.push(' ');
+            }
+            accumulated.push_str(&token);
+            events.push(stream_event(
+                "token",
+                StreamTokenEvent {
+                    delta: token,
+                    accumulated: accumulated.clone(),
+                },
+            ));
+        }
+
+        let prev_state = context.state.clone();
+        let next_state = apply_state_mutation(&prev_state, &request.content, &agent_output);
+        let diff = compute_diff(&prev_state, &next_state);
+        let state_event = self
+            .append_event(session_id, EVENT_TYPE_STATE_UPDATE, diff.clone())
+            .await?;
+        let deltashot = self
+            .create_deltashot(
+                session_id,
+                EVENT_TYPE_STATE_UPDATE,
+                state_event.payload.clone(),
+                next_state.clone(),
+            )
+            .await?;
+
+        let mut artifact_envelopes = Vec::new();
+        if let (Some(artifact_type), Some(content)) = (
+            agent_output.artifact_type.clone(),
+            agent_output.artifact_content.clone(),
+        ) {
+            let outcome = self
+                .create_or_update_artifact_internal(session_id, &artifact_type, &content)
+                .await?;
+            artifact_envelopes.push(outcome.envelope.clone());
+        }
+
+        let agent_message = self
+            .append_message(session_id, "agent", &agent_output.text)
+            .await?;
+        let _ = self
+            .append_event(
+                session_id,
+                EVENT_TYPE_MESSAGE_APPEND,
+                serde_json::json!({
+                    "role": "agent",
+                    "message_id": agent_message.id,
+                    "content": agent_output.text,
+                }),
+            )
+            .await?;
+        self.persist_state(session_id, next_state.clone()).await?;
+
+        events.push(stream_event(
+            "message",
+            StreamMessageEvent {
+                message_id: agent_message.id,
+                content: agent_output.text.clone(),
+            },
+        ));
+        events.push(stream_event(
+            "deltashot",
+            StreamDeltaShotEvent {
+                id: deltashot.id,
+                event_type: EVENT_TYPE_STATE_UPDATE.to_owned(),
+            },
+        ));
+        for artifact in artifact_envelopes {
+            events.push(stream_event(
+                "artifact",
+                StreamArtifactEvent {
+                    artifact_id: artifact.artifact_id,
+                    version: artifact.version,
+                    artifact_type: artifact.artifact_type,
+                },
+            ));
+        }
+
+        if matches!(request.mode, MessageMode::Workflow | MessageMode::Execution) {
+            let workflow_step = next_state.step.unwrap_or_else(|| "continue".to_owned());
+            events.push(stream_event(
+                "workflow",
+                StreamWorkflowEvent {
+                    step: workflow_step,
+                    status: "started".to_owned(),
+                },
+            ));
+        }
+
+        Ok(())
+    }
+
     async fn hydrate_context(&self, session_id: &str) -> SessionContext {
         let mut sessions = self.sessions.write().await;
         let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
@@ -1398,6 +2060,7 @@ impl ExecutionPipeline {
                 "Adhoc Session".to_owned(),
             )
         });
+        ensure_session_branches(session);
 
         let mut memory = session.messages.clone();
         memory.reverse();
@@ -1468,7 +2131,9 @@ impl ExecutionPipeline {
                 "Adhoc Session".to_owned(),
             )
         });
+        ensure_session_branches(session);
         session.messages.push(message.clone());
+        sync_active_branch_from_session(session);
 
         Ok(message)
     }
@@ -1494,7 +2159,9 @@ impl ExecutionPipeline {
                 "Adhoc Session".to_owned(),
             )
         });
+        ensure_session_branches(session);
         session.events.push(event.clone());
+        sync_active_branch_from_session(session);
         Ok(event)
     }
 
@@ -1513,6 +2180,7 @@ impl ExecutionPipeline {
                 "Adhoc Session".to_owned(),
             )
         });
+        ensure_session_branches(session);
 
         let id = self.next_id("ds");
         let timestamp = now_ms();
@@ -1543,6 +2211,7 @@ impl ExecutionPipeline {
 
         session.hashchain.push(hash);
         session.deltashot_ids.push(id.clone());
+        sync_active_branch_from_session(session);
         drop(sessions);
 
         let mut all = self.deltashots.write().await;
@@ -1556,24 +2225,87 @@ impl ExecutionPipeline {
         artifact_type: &str,
         content: &str,
     ) -> Result<ArtifactWriteOutcome, PipelineError> {
-        let mut artifacts = self.artifacts.write().await;
-        let artifact_id = format!("art_{}", session_id);
-        let record = artifacts
-            .entry(artifact_id.clone())
-            .or_insert_with(|| ArtifactRecord {
-                artifact_id: artifact_id.clone(),
-                session_id: session_id.to_owned(),
-                artifact_type: artifact_type.to_owned(),
-                created_at: now_ms(),
-                current_version: 0,
-                versions: BTreeMap::new(),
+        let (active_branch_id, branch_artifact_ids) = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
+                SessionRecord::new(
+                    session_id.to_owned(),
+                    "adhoc".to_owned(),
+                    "Adhoc Session".to_owned(),
+                )
             });
+            ensure_session_branches(session);
+            (session.active_branch_id.clone(), session.artifacts.clone())
+        };
 
-        let previous_content = record.versions.get(&record.current_version).cloned();
-        record.current_version += 1;
-        record
-            .versions
-            .insert(record.current_version, content.to_owned());
+        let mut artifacts = self.artifacts.write().await;
+        let matching_artifact_id = branch_artifact_ids.iter().find_map(|artifact_id| {
+            artifacts.get(artifact_id).and_then(|record| {
+                (record.artifact_type == artifact_type).then_some(artifact_id.clone())
+            })
+        });
+
+        let mut replaced_artifact_id = None;
+        let (artifact_id, artifact_type, version, previous_content) = match matching_artifact_id {
+            Some(existing_id) => {
+                let existing = artifacts.get(&existing_id).cloned().ok_or_else(|| {
+                    PipelineError::NotFound(format!("artifact '{}' not found", existing_id))
+                })?;
+                if existing.branch_id == active_branch_id {
+                    let record = artifacts.get_mut(&existing_id).ok_or_else(|| {
+                        PipelineError::NotFound(format!("artifact '{}' not found", existing_id))
+                    })?;
+                    let previous = record.versions.get(&record.current_version).cloned();
+                    record.current_version += 1;
+                    record
+                        .versions
+                        .insert(record.current_version, content.to_owned());
+                    (
+                        existing_id,
+                        record.artifact_type.clone(),
+                        record.current_version,
+                        previous,
+                    )
+                } else {
+                    let new_id = self.next_id("art");
+                    let mut cloned = existing.clone();
+                    cloned.artifact_id = new_id.clone();
+                    cloned.branch_id = active_branch_id.clone();
+                    cloned.current_version += 1;
+                    let previous = existing.versions.get(&existing.current_version).cloned();
+                    cloned
+                        .versions
+                        .insert(cloned.current_version, content.to_owned());
+                    artifacts.insert(new_id.clone(), cloned.clone());
+                    replaced_artifact_id = Some(existing_id);
+                    (
+                        new_id,
+                        cloned.artifact_type,
+                        cloned.current_version,
+                        previous,
+                    )
+                }
+            }
+            None => {
+                let new_id = self.next_id("art");
+                let mut versions = BTreeMap::new();
+                versions.insert(1, content.to_owned());
+                artifacts.insert(
+                    new_id.clone(),
+                    ArtifactRecord {
+                        artifact_id: new_id.clone(),
+                        session_id: session_id.to_owned(),
+                        branch_id: active_branch_id.clone(),
+                        artifact_type: artifact_type.to_owned(),
+                        created_at: now_ms(),
+                        current_version: 1,
+                        versions,
+                    },
+                );
+                (new_id, artifact_type.to_owned(), 1, None)
+            }
+        };
+        drop(artifacts);
 
         {
             let mut sessions = self.sessions.write().await;
@@ -1584,14 +2316,19 @@ impl ExecutionPipeline {
                     "Adhoc Session".to_owned(),
                 )
             });
+            ensure_session_branches(session);
+            if let Some(previous_id) = replaced_artifact_id {
+                session.artifacts.remove(&previous_id);
+            }
             session.artifacts.insert(artifact_id.clone());
+            sync_active_branch_from_session(session);
         }
 
         Ok(ArtifactWriteOutcome {
             envelope: ArtifactEnvelope {
                 artifact_id,
-                version: record.current_version,
-                artifact_type: record.artifact_type.clone(),
+                version,
+                artifact_type,
             },
             previous_content,
         })
@@ -1610,7 +2347,9 @@ impl ExecutionPipeline {
                 "Adhoc Session".to_owned(),
             )
         });
+        ensure_session_branches(session);
         session.state = next_state;
+        sync_active_branch_from_session(session);
         Ok(())
     }
 
@@ -1970,6 +2709,97 @@ fn apply_diff_to_state(state: &mut SessionState, diff: &Value) {
             }
             _ => {}
         }
+    }
+}
+
+fn ensure_session_branches(session: &mut SessionRecord) {
+    if !session.branches.contains_key(MAIN_BRANCH_ID) {
+        let main = BranchRecord {
+            branch_id: MAIN_BRANCH_ID.to_owned(),
+            session_id: session.session_id.clone(),
+            parent_deltashot_id: session.deltashot_ids.first().cloned().unwrap_or_default(),
+            created_at: session.created_at,
+            label: None,
+            mode: BranchMode::Soft,
+            state: session.state.clone(),
+            messages: session.messages.clone(),
+            events: session.events.clone(),
+            hashchain: session.hashchain.clone(),
+            deltashot_ids: session.deltashot_ids.clone(),
+            artifacts: session.artifacts.clone(),
+        };
+        session.branches.insert(MAIN_BRANCH_ID.to_owned(), main);
+    }
+
+    if !session.branches.contains_key(&session.active_branch_id) {
+        session.active_branch_id = MAIN_BRANCH_ID.to_owned();
+    }
+}
+
+fn active_branch_mut(session: &mut SessionRecord) -> Result<&mut BranchRecord, PipelineError> {
+    ensure_session_branches(session);
+    session
+        .branches
+        .get_mut(&session.active_branch_id)
+        .ok_or_else(|| PipelineError::Internal("active branch missing".to_owned()))
+}
+
+fn active_branch(session: &SessionRecord) -> Result<&BranchRecord, PipelineError> {
+    session
+        .branches
+        .get(&session.active_branch_id)
+        .ok_or_else(|| PipelineError::Internal("active branch missing".to_owned()))
+}
+
+fn sync_active_branch_from_session(session: &mut SessionRecord) {
+    let snapshot_state = session.state.clone();
+    let snapshot_messages = session.messages.clone();
+    let snapshot_events = session.events.clone();
+    let snapshot_hashchain = session.hashchain.clone();
+    let snapshot_deltashots = session.deltashot_ids.clone();
+    let snapshot_artifacts = session.artifacts.clone();
+    if let Ok(branch) = active_branch_mut(session) {
+        branch.state = snapshot_state;
+        branch.messages = snapshot_messages;
+        branch.events = snapshot_events;
+        branch.hashchain = snapshot_hashchain;
+        branch.deltashot_ids = snapshot_deltashots;
+        branch.artifacts = snapshot_artifacts;
+    }
+}
+
+fn load_branch_into_session(
+    session: &mut SessionRecord,
+    branch_id: &str,
+) -> Result<(), PipelineError> {
+    ensure_session_branches(session);
+    let branch = session
+        .branches
+        .get(branch_id)
+        .cloned()
+        .ok_or_else(|| PipelineError::NotFound(format!("branch '{}' not found", branch_id)))?;
+    session.active_branch_id = branch.branch_id.clone();
+    session.state = branch.state;
+    session.messages = branch.messages;
+    session.events = branch.events;
+    session.hashchain = branch.hashchain;
+    session.deltashot_ids = branch.deltashot_ids;
+    session.artifacts = branch.artifacts;
+    Ok(())
+}
+
+fn tokenize_stream_chunks(content: &str) -> Vec<String> {
+    content
+        .split_whitespace()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+}
+
+fn stream_event<T: Serialize>(event: &str, data: T) -> StreamEventEnvelope {
+    let payload = serde_json::to_value(data).unwrap_or(Value::Null);
+    StreamEventEnvelope {
+        event: event.to_owned(),
+        data: payload,
     }
 }
 

@@ -3,18 +3,25 @@ use std::time::Instant;
 
 use axum::{
     extract::{Path, Query, State},
+    http::HeaderMap,
     http::StatusCode,
-    response::IntoResponse,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
+use futures_util::stream;
 use serde::Deserialize;
 
 use crate::pipeline::{
     ApiErrorBody, ApiErrorEnvelope, ApiResponseMeta, ArtifactVersionView, ArtifactWriteRequest,
-    CreateSessionRequest, CreateWorkspaceRequest, DeltashotView, ExecutionTrace,
-    ForceAgentRequest, MessageRecord, PipelineError, PipelineState, RollbackRequest,
-    SendMessageRequestV1, SessionView, WorkflowStartRequest, WorkflowStepRequest,
+    BranchCreateRequest, BranchListResponse, BranchMergeRequest, BranchMergeResponse,
+    BranchSwitchRequest, BranchSwitchResponse, CreateSessionRequest, CreateWorkspaceRequest,
+    DeltashotView, ExecutionTrace, ForceAgentRequest, MessageRecord, PipelineError, PipelineState,
+    RollbackRequest, SendMessageRequestV1, SessionView, StreamMessageRequestV1,
+    WorkflowStartRequest, WorkflowStepRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +68,14 @@ pub fn router() -> Router<Arc<PipelineState>> {
         .route("/sessions/{sessionId}/agent", post(force_agent_selection))
         .route("/sessions/{sessionId}/agents/logs", get(get_agent_logs))
         .route("/sessions/{sessionId}/trace", get(get_trace))
+        .route("/sessions/{sessionId}/branch", post(create_branch))
+        .route("/sessions/{sessionId}/branches", get(list_branches))
+        .route("/sessions/{sessionId}/branch/switch", post(switch_branch))
+        .route("/sessions/{sessionId}/branch/merge", post(merge_branch))
+        .route(
+            "/sessions/{sessionId}/messages/stream",
+            post(stream_message),
+        )
         .route("/health", get(health))
 }
 
@@ -290,6 +305,75 @@ async fn get_trace(
 
 async fn health(State(state): State<Arc<PipelineState>>) -> impl IntoResponse {
     with_meta(async move { Ok::<_, PipelineError>(state.health()) }).await
+}
+
+async fn create_branch(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+    Json(request): Json<BranchCreateRequest>,
+) -> impl IntoResponse {
+    with_meta(async move { state.create_branch(&session_id, request).await }).await
+}
+
+async fn list_branches(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    with_meta(async move {
+        let branches = state.list_branches(&session_id).await?;
+        Ok::<BranchListResponse, PipelineError>(branches)
+    })
+    .await
+}
+
+async fn switch_branch(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+    Json(request): Json<BranchSwitchRequest>,
+) -> impl IntoResponse {
+    with_meta(async move {
+        let switched = state.switch_branch(&session_id, request).await?;
+        Ok::<BranchSwitchResponse, PipelineError>(switched)
+    })
+    .await
+}
+
+async fn merge_branch(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+    Json(request): Json<BranchMergeRequest>,
+) -> impl IntoResponse {
+    with_meta(async move {
+        let merged = state.merge_branch(&session_id, request).await?;
+        Ok::<BranchMergeResponse, PipelineError>(merged)
+    })
+    .await
+}
+
+async fn stream_message(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+    headers: HeaderMap,
+    Json(request): Json<StreamMessageRequestV1>,
+) -> impl IntoResponse {
+    let idempotency_key = headers
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let events = state
+        .stream_message_v1(&session_id, request, idempotency_key)
+        .await;
+
+    let sse_stream = stream::iter(events.into_iter().map(|envelope| {
+        let payload = serde_json::to_string(&envelope.data).unwrap_or_else(|_| {
+            "{\"code\":\"SERIALIZATION_ERROR\",\"retryable\":false}".to_owned()
+        });
+        Ok::<Event, std::convert::Infallible>(Event::default().event(envelope.event).data(payload))
+    }));
+
+    Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response()
 }
 
 async fn with_meta<T, F>(fut: F) -> impl IntoResponse

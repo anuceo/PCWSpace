@@ -10,6 +10,8 @@ axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+futures-util.workspace = true
 streaming = { path = "../streaming" }
 delta-core = { path = "../core" }
 uuid.workspace = true

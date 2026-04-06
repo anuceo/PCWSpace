@@ -45,11 +45,13 @@ dependencies = [
  "axum",
  "blake3",
  "delta-core",
+ "futures-util",
  "serde",
  "serde_json",
  "streaming",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tracing",
  "uuid",
 ]

@@ -224,11 +224,25 @@ const KEY_SPECS: &[KeySpec] = &[
         notes: "Session branches index",
     },
     KeySpec {
+        key_name: "session_active_branch",
+        template: "{env}:session:{sessionId}:active_branch",
+        primitive: RedisPrimitive::String,
+        retention: RetentionClass::Persistent,
+        notes: "Active branch pointer for session",
+    },
+    KeySpec {
         key_name: "branch_events",
         template: "{env}:branch:{branchId}:events",
         primitive: RedisPrimitive::Stream,
         retention: RetentionClass::Persistent,
         notes: "Per-branch event stream",
+    },
+    KeySpec {
+        key_name: "branch_state",
+        template: "{env}:branch:{branchId}:state",
+        primitive: RedisPrimitive::Json,
+        retention: RetentionClass::Persistent,
+        notes: "Per-branch state snapshot",
     },
     KeySpec {
         key_name: "session_snapshot",
@@ -480,6 +494,11 @@ impl RedisKeyspace {
         Ok(self.compose(&["session", session_id, "branches"]))
     }
 
+    pub fn session_active_branch(&self, session_id: &str) -> Result<String, CoreError> {
+        self.validate_id("session_id", session_id)?;
+        Ok(self.compose(&["session", session_id, "active_branch"]))
+    }
+
     pub fn session_snapshot(&self, session_id: &str, snapshot_n: u64) -> Result<String, CoreError> {
         self.validate_id("session_id", session_id)?;
         Ok(self.compose(&["session", session_id, "snapshot", &snapshot_n.to_string()]))
@@ -623,6 +642,11 @@ impl RedisKeyspace {
     pub fn branch_events(&self, branch_id: &str) -> Result<String, CoreError> {
         self.validate_id("branch_id", branch_id)?;
         Ok(self.compose(&["branch", branch_id, "events"]))
+    }
+
+    pub fn branch_state(&self, branch_id: &str) -> Result<String, CoreError> {
+        self.validate_id("branch_id", branch_id)?;
+        Ok(self.compose(&["branch", branch_id, "state"]))
     }
 
     pub fn branch_pubsub(&self, branch_id: &str) -> Result<String, CoreError> {
@@ -782,6 +806,12 @@ mod tests {
         assert!(key_specs()
             .iter()
             .any(|spec| spec.key_name == "queue_branch_priority"));
+        assert!(key_specs()
+            .iter()
+            .any(|spec| spec.key_name == "session_active_branch"));
+        assert!(key_specs()
+            .iter()
+            .any(|spec| spec.key_name == "branch_state"));
         assert!(key_specs()
             .iter()
             .any(|spec| spec.key_name == "lock_session"));
