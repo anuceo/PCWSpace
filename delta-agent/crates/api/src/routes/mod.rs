@@ -1,12 +1,14 @@
+pub mod api_v1;
 pub mod branches;
 pub mod sessions;
 pub mod streaming;
 
 use axum::Router;
 
-pub fn router() -> Router {
+use crate::pipeline::PipelineState;
+
+pub fn router(state: PipelineState) -> Router {
     Router::new()
-        .merge(sessions::router())
-        .merge(branches::router())
-        .merge(streaming::router())
+        .nest("/api/v1", api_v1::router())
+        .with_state(std::sync::Arc::new(state))
 }

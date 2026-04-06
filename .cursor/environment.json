@@ -1,0 +1,14 @@
+{
+  "install": "bash -lc 'set -euo pipefail; mkdir -p /workspace/.cache/cargo-target/delta-agent; cd /workspace/delta-agent; ./scripts/setup.sh'",
+  "start": "bash -lc 'set -euo pipefail; mkdir -p /workspace/.cache/cargo-target/delta-agent'",
+  "env": {
+    "CARGO_TARGET_DIR": "/workspace/.cache/cargo-target/delta-agent",
+    "RUSTUP_TOOLCHAIN": "stable"
+  },
+  "persistedDirectories": [
+    "/home/ubuntu/.cargo/registry",
+    "/home/ubuntu/.cargo/git",
+    "/home/ubuntu/.rustup",
+    "/workspace/.cache/cargo-target/delta-agent"
+  ]
+}

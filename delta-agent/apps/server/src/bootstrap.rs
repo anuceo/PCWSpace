@@ -12,7 +12,8 @@ pub async fn run() -> anyhow::Result<()> {
     let config_path = resolve_config_path();
     let config = load(&config_path)?;
 
-    let app = api::router();
+    let pipeline = api::pipeline::ExecutionPipeline::new("prod")?;
+    let app = api::router_with_pipeline(pipeline);
     let addr = format!("{}:{}", config.host, config.port)
         .parse::<SocketAddr>()
         .context("invalid server bind address")?;

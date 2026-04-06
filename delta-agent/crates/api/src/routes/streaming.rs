@@ -1,9 +1,9 @@
-use axum::{response::IntoResponse, routing::get, Router};
+use std::sync::Arc;
 
-pub fn router() -> Router {
-    Router::new().route("/streaming/ping", get(ping))
-}
+use axum::Router;
 
-async fn ping() -> impl IntoResponse {
-    "streaming-ok"
+use crate::pipeline::PipelineState;
+
+pub fn router() -> Router<Arc<PipelineState>> {
+    Router::new()
 }

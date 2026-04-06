@@ -14,4 +14,10 @@ rustup component add rustfmt clippy
 echo "Fetching workspace dependencies..."
 cargo fetch --locked || cargo fetch
 
+if [[ "${DELTA_AGENT_PREWARM:-1}" == "1" ]]; then
+  echo "Prewarming build artifacts (check + test --no-run)..."
+  cargo check --workspace
+  cargo test --workspace --no-run
+fi
+
 echo "Environment setup complete."
