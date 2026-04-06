@@ -5,6 +5,10 @@ use serde_json::Value;
 
 use crate::ops::{Op, OpType};
 
+pub fn compute_diff(prev: &Value, next: &Value) -> Result<Vec<Op>> {
+    compute_diff_ops(prev, next)
+}
+
 pub fn compute_diff_ops(prev: &Value, next: &Value) -> Result<Vec<Op>> {
     let mut ops = Vec::new();
     diff_recursive("root", prev, next, &mut ops)?;
@@ -79,8 +83,8 @@ fn handle_array_diff(path: &str, prev: &[Value], next: &[Value], ops: &mut Vec<O
 mod tests {
     use serde_json::json;
 
-    use super::compute_diff_ops;
-    use crate::apply::apply_ops_to_state;
+    use super::{compute_diff, compute_diff_ops};
+    use crate::apply::apply_ops;
     use crate::ops::OpType;
 
     #[test]
@@ -120,10 +124,10 @@ mod tests {
         let prev = json!({"a": 1});
         let next = json!({"a": 2, "b": 3});
 
-        let ops = compute_diff_ops(&prev, &next).expect("diff should compute");
+        let ops = compute_diff(&prev, &next).expect("diff should compute");
 
         let mut state = prev.clone();
-        state = apply_ops_to_state(&state, &ops).expect("ops should apply");
+        apply_ops(&mut state, &ops).expect("ops should apply");
 
         assert_eq!(state, next);
     }

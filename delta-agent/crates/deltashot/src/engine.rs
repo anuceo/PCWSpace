@@ -51,7 +51,7 @@ mod tests {
     #[test]
     fn verifies_chain_integrity() {
         let first_ops = vec![Op::new(
-            "/goal".to_owned(),
+            "root.goal".to_owned(),
             OpType::Set,
             Some(json!("draft")),
         )];
@@ -76,7 +76,7 @@ mod tests {
         };
 
         let second_ops = vec![Op::new(
-            "/goal".to_owned(),
+            "root.goal".to_owned(),
             OpType::Replace,
             Some(json!("final")),
         )];

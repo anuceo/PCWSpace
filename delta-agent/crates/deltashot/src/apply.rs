@@ -3,11 +3,16 @@ use serde_json::Value;
 
 use crate::ops::{Op, OpType};
 
+pub fn apply_ops(state: &mut Value, ops: &[Op]) -> Result<()> {
+    for op in ops {
+        apply_single_op(state, op)?;
+    }
+    Ok(())
+}
+
 pub fn apply_ops_to_state(base: &Value, ops: &[Op]) -> Result<Value> {
     let mut state = base.clone();
-    for op in ops {
-        apply_single_op(&mut state, op)?;
-    }
+    apply_ops(&mut state, ops)?;
     Ok(state)
 }
 
@@ -216,7 +221,7 @@ fn parse_path(path: &str) -> Result<Vec<PathToken>> {
 mod tests {
     use serde_json::json;
 
-    use super::apply_ops_to_state;
+    use super::apply_ops;
     use crate::ops::{Op, OpType};
 
     #[test]
@@ -236,7 +241,8 @@ mod tests {
             Op::new("root.obsolete".to_owned(), OpType::Delete, None),
         ];
 
-        let next = apply_ops_to_state(&base, &ops).expect("ops should apply");
+        let mut next = base.clone();
+        apply_ops(&mut next, &ops).expect("ops should apply");
         assert_eq!(next.get("goal"), Some(&json!("final")));
         assert_eq!(next.get("items"), Some(&json!(["a", "b"])));
         assert!(next.get("obsolete").is_none());
@@ -246,9 +252,9 @@ mod tests {
     fn applies_diff_to_exact_reconstruction() {
         let prev = json!({"a": 1});
         let next = json!({"a": 2, "b": 3});
-        let ops = crate::diff::compute_diff_ops(&prev, &next).expect("diff should compute");
+        let ops = crate::diff::compute_diff(&prev, &next).expect("diff should compute");
         let mut state = prev.clone();
-        state = apply_ops_to_state(&state, &ops).expect("apply should work");
+        apply_ops(&mut state, &ops).expect("apply should work");
         assert_eq!(state, next);
     }
 }
