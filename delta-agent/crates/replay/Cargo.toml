@@ -6,6 +6,12 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-rayon.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+brotli.workspace = true
+deltashot = { path = "../deltashot" }
 delta-core = { path = "../core" }
 hashing = { path = "../hashing" }
