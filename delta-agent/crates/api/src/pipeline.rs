@@ -31,12 +31,6 @@ const MAIN_BRANCH_ID: &str = "br_main";
 
 static PIPELINE: OnceLock<ExecutionPipeline> = OnceLock::new();
 
-#[derive(Debug, Clone)]
-struct PersistenceConfig {
-    redis_url: String,
-    vddab_root: String,
-}
-
 #[derive(Debug, Clone, Error)]
 pub enum PipelineError {
     #[error("invalid input: {0}")]
@@ -525,6 +519,16 @@ pub struct StreamErrorEvent {
     pub retryable: bool,
 }
 
+// ==========================================================
+// Section 1: Context structs
+// ==========================================================
+
+#[derive(Debug, Clone)]
+struct PersistenceConfig {
+    redis_url: String,
+    vddab_root: String,
+}
+
 #[derive(Debug, Clone)]
 struct WorkspaceRecord {
     workspace_id: String,
@@ -703,6 +707,10 @@ struct ArtifactWriteOutcome {
     previous_content: Option<String>,
 }
 
+// ==========================================================
+// Section 2: Pipeline state + initialization
+// ==========================================================
+
 #[derive(Debug)]
 pub struct ExecutionPipeline {
     keyspace: RedisKeyspace,
@@ -722,6 +730,10 @@ pub struct ExecutionPipeline {
 }
 
 pub type PipelineState = ExecutionPipeline;
+
+// ==========================================================
+// Section 3: Core execution flow (lock -> execute -> commit)
+// ==========================================================
 
 impl ExecutionPipeline {
     pub fn new(env: &str) -> Result<Self, PipelineError> {
@@ -2725,6 +2737,10 @@ impl ExecutionPipeline {
     }
 }
 
+// ==========================================================
+// Section 4: Runtime entrypoints + deterministic helpers
+// ==========================================================
+
 pub fn shared_pipeline() -> &'static ExecutionPipeline {
     PIPELINE.get_or_init(|| {
         let env = std::env::var("DELTA_AGENT_ENV").unwrap_or_else(|_| "dev".to_owned());
@@ -3037,6 +3053,10 @@ fn compress_ops(payload: &[u8]) -> Vec<u8> {
         payload.to_vec()
     }
 }
+
+// ==========================================================
+// Section 5: Tests
+// ==========================================================
 
 fn now_ms() -> u64 {
     SystemTime::now()
