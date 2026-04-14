@@ -892,6 +892,17 @@ impl ExecutionPipeline {
         })
     }
 
+    pub async fn get_session_view(&self, session_id: &str) -> Option<SessionView> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(session_id)?;
+        Some(SessionView {
+            session_id: session.session_id.clone(),
+            status: session.status.clone(),
+            workflow_id: session.workflow_id.clone(),
+            state_version: session.state.version,
+        })
+    }
+
     pub async fn handle_message_v1(
         &self,
         session_id: &str,

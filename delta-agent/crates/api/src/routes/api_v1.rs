@@ -45,6 +45,8 @@ pub fn router() -> Router<Arc<PipelineState>> {
             get(list_workspace_sessions),
         )
         .route("/sessions", post(create_session))
+        .route("/sessions/{sessionId}", get(get_session))
+        .route("/sessions/{sessionId}/", get(get_session))
         .route("/sessions/{sessionId}/messages", post(send_message))
         .route("/sessions/{sessionId}/state", get(get_session_state))
         .route("/sessions/{sessionId}/messages", get(get_session_messages))
@@ -120,6 +122,19 @@ async fn create_session(
     Json(request): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     with_meta(async move { state.create_session(request).await }).await
+}
+
+async fn get_session(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    with_meta(async move {
+        state
+            .get_session_view(&session_id)
+            .await
+            .ok_or_else(|| PipelineError::NotFound(format!("session '{}' not found", session_id)))
+    })
+    .await
 }
 
 async fn send_message(
