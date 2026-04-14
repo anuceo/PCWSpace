@@ -1,17 +1,26 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use delta_core::redis_schema::{
     validate_spec_integrity, RedisKeyspace, EVENT_TYPE_ARTIFACT_UPDATE, EVENT_TYPE_MESSAGE_APPEND,
-    EVENT_TYPE_STATE_UPDATE,
+    EVENT_TYPE_STATE_UPDATE, SNAPSHOT_INTERVAL_EVENTS,
+};
+use deltashot::{
+    apply_ops_to_state, canonical_serialize_ops, compute_chain_hash, compute_diff_ops, DeltaShot,
+    DeltaShotMetadata, DeltaShotOp, OpType,
+};
+use replay::{
+    adapters::RedisVddabRepository,
+    verifier::{audit_replay, verify_chain, ReplayAuditResult, VerificationResult},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
-use tracing::info;
+use tracing::{info, warn};
 
 const RECENT_MESSAGE_WINDOW: usize = 20;
 const SESSION_LOCK_TTL_SECS: u64 = 5;
@@ -365,6 +374,14 @@ pub struct HealthResponse {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchAuditResponse {
+    pub branch_id: String,
+    pub valid: bool,
+    pub chain: VerificationResult,
+    pub replay: ReplayAuditResult,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BranchMode {
@@ -502,6 +519,16 @@ pub struct StreamErrorEvent {
     pub retryable: bool,
 }
 
+// ==========================================================
+// Section 1: Context structs
+// ==========================================================
+
+#[derive(Debug, Clone)]
+struct PersistenceConfig {
+    redis_url: String,
+    vddab_root: String,
+}
+
 #[derive(Debug, Clone)]
 struct WorkspaceRecord {
     workspace_id: String,
@@ -599,12 +626,14 @@ struct SessionEvent {
 struct DeltashotRecord {
     id: String,
     session_id: String,
+    branch_id: String,
     timestamp: u64,
     event_type: String,
-    diff: Value,
+    ops: Vec<DeltaShotOp>,
     hash: String,
-    prev_hash: Option<String>,
+    prev_hash: String,
     state_snapshot: SessionState,
+    metadata: DeltaShotMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -678,9 +707,14 @@ struct ArtifactWriteOutcome {
     previous_content: Option<String>,
 }
 
+// ==========================================================
+// Section 2: Pipeline state + initialization
+// ==========================================================
+
 #[derive(Debug)]
 pub struct ExecutionPipeline {
     keyspace: RedisKeyspace,
+    persistence: Option<PersistenceConfig>,
     id_counter: AtomicU64,
     workspaces: RwLock<HashMap<String, WorkspaceRecord>>,
     workspace_sessions: RwLock<HashMap<String, Vec<(u64, String)>>>,
@@ -697,6 +731,10 @@ pub struct ExecutionPipeline {
 
 pub type PipelineState = ExecutionPipeline;
 
+// ==========================================================
+// Section 3: Core execution flow (lock -> execute -> commit)
+// ==========================================================
+
 impl ExecutionPipeline {
     pub fn new(env: &str) -> Result<Self, PipelineError> {
         let keyspace = RedisKeyspace::new(env)
@@ -706,6 +744,7 @@ impl ExecutionPipeline {
 
         Ok(Self {
             keyspace,
+            persistence: load_persistence_config(),
             id_counter: AtomicU64::new(1),
             workspaces: RwLock::new(HashMap::new()),
             workspace_sessions: RwLock::new(HashMap::new()),
@@ -933,24 +972,35 @@ impl ExecutionPipeline {
 
         let prev_state = context.state.clone();
         let next_state = apply_state_mutation(&prev_state, &request.content, &agent_output);
-        let diff = compute_diff(&prev_state, &next_state);
+        let ops = state_ops_from_states(&prev_state, &next_state);
+        let diff = ops_to_diff_view(&ops);
         self.record_execution_step(
             session_id,
             "STATE_DIFF_COMPUTED",
-            serde_json::json!({ "changes": diff.get("changes").cloned().unwrap_or(Value::Null) }),
+            serde_json::json!({ "ops_count": ops.len() }),
         )
         .await?;
 
-        let state_event = self
-            .append_event(session_id, EVENT_TYPE_STATE_UPDATE, diff.clone())
+        self.append_event(session_id, EVENT_TYPE_STATE_UPDATE, diff.clone())
             .await?;
 
         let deltashot = self
             .create_deltashot(
                 session_id,
                 EVENT_TYPE_STATE_UPDATE,
-                state_event.payload.clone(),
+                ops.clone(),
                 next_state.clone(),
+                DeltaShotMetadata {
+                    event_type: EVENT_TYPE_STATE_UPDATE.to_owned(),
+                    agent: Some(
+                        match agent {
+                            AgentKind::Claude => "claude",
+                            AgentKind::DeepSeek => "deepseek",
+                        }
+                        .to_owned(),
+                    ),
+                    workflow_step: next_state.step.clone(),
+                },
             )
             .await?;
         self.record_execution_step(
@@ -1175,9 +1225,13 @@ impl ExecutionPipeline {
                 id: ds.id.clone(),
                 timestamp: ds.timestamp,
                 event_type: ds.event_type.clone(),
-                diff: ds.diff.clone(),
+                diff: ops_to_diff_value(&ds.ops),
                 hash: ds.hash.clone(),
-                prev_hash: ds.prev_hash.clone(),
+                prev_hash: if ds.prev_hash.is_empty() {
+                    None
+                } else {
+                    Some(ds.prev_hash.clone())
+                },
             })
             .collect::<Vec<_>>()
     }
@@ -1189,9 +1243,13 @@ impl ExecutionPipeline {
             id: ds.id.clone(),
             timestamp: ds.timestamp,
             event_type: ds.event_type.clone(),
-            diff: ds.diff.clone(),
+            diff: ops_to_diff_value(&ds.ops),
             hash: ds.hash.clone(),
-            prev_hash: ds.prev_hash.clone(),
+            prev_hash: if ds.prev_hash.is_empty() {
+                None
+            } else {
+                Some(ds.prev_hash.clone())
+            },
         })
     }
 
@@ -1246,17 +1304,21 @@ impl ExecutionPipeline {
 
             drop(sessions);
 
-            let rollback_diff = compute_diff(&prev_state, &rebuilt_state);
-            let rollback_event = self
-                .append_event(session_id, "ROLLBACK", rollback_diff)
+            let rollback_ops = state_ops_from_states(&prev_state, &rebuilt_state);
+            self.append_event(session_id, "ROLLBACK", ops_to_diff_value(&rollback_ops))
                 .await?;
 
             let rollback_ds = self
                 .create_deltashot(
                     session_id,
                     "ROLLBACK",
-                    rollback_event.payload,
+                    rollback_ops,
                     rebuilt_state.clone(),
+                    DeltaShotMetadata {
+                        event_type: "ROLLBACK".to_owned(),
+                        agent: None,
+                        workflow_step: None,
+                    },
                 )
                 .await?;
 
@@ -1561,6 +1623,157 @@ impl ExecutionPipeline {
         }
     }
 
+    pub async fn debug_audit_branch(
+        &self,
+        branch_id: &str,
+    ) -> Result<BranchAuditResponse, PipelineError> {
+        let redis_url = std::env::var("DELTA_AGENT_REDIS_URL").map_err(|_| {
+            PipelineError::InvalidInput("DELTA_AGENT_REDIS_URL is not set".to_owned())
+        })?;
+        let vddab_root =
+            std::env::var("DELTA_AGENT_VDDAB_ROOT").unwrap_or_else(|_| "./data/vddab".to_owned());
+
+        let repo = RedisVddabRepository::connect(&redis_url, self.keyspace.clone(), vddab_root)
+            .await
+            .map_err(|err| PipelineError::Internal(format!("audit backend init failed: {err}")))?;
+
+        let chain = verify_chain(&repo, branch_id)
+            .await
+            .map_err(|err| PipelineError::Internal(format!("chain audit failed: {err}")))?;
+        let replay = audit_replay(&repo, &repo, branch_id)
+            .await
+            .map_err(|err| PipelineError::Internal(format!("replay audit failed: {err}")))?;
+
+        Ok(BranchAuditResponse {
+            branch_id: branch_id.to_owned(),
+            valid: chain.valid && replay.valid,
+            chain,
+            replay,
+        })
+    }
+
+    async fn persistence_backend(&self) -> Option<RedisVddabRepository> {
+        let Some(config) = self.persistence.as_ref() else {
+            return None;
+        };
+        match RedisVddabRepository::connect(
+            &config.redis_url,
+            self.keyspace.clone(),
+            &config.vddab_root,
+        )
+        .await
+        {
+            Ok(repo) => Some(repo),
+            Err(err) => {
+                warn!(error = %err, "failed to initialize persistence backend");
+                None
+            }
+        }
+    }
+
+    async fn persist_active_branch_pointer(&self, session_id: &str, branch_id: &str) {
+        if let Some(repo) = self.persistence_backend().await {
+            if let Err(err) = repo.set_session_active_branch(session_id, branch_id).await {
+                warn!(
+                    session_id = %session_id,
+                    branch_id = %branch_id,
+                    error = %err,
+                    "failed to persist active branch pointer"
+                );
+            }
+        }
+    }
+
+    async fn persist_branch_state_value(&self, branch_id: &str, state: &SessionState) {
+        if let Some(repo) = self.persistence_backend().await {
+            let value = value_from_state(state);
+            if let Err(err) = repo.store_branch_state(branch_id, &value).await {
+                warn!(
+                    branch_id = %branch_id,
+                    error = %err,
+                    "failed to persist branch state"
+                );
+                return;
+            }
+            if state.version > 0 && state.version % SNAPSHOT_INTERVAL_EVENTS == 0 {
+                if let Err(err) = repo
+                    .store_snapshot(branch_id, state.version as usize, &value)
+                    .await
+                {
+                    warn!(
+                        branch_id = %branch_id,
+                        version = state.version,
+                        error = %err,
+                        "failed to persist snapshot"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn persist_deltashot_record(&self, record: &DeltashotRecord) {
+        if let Some(repo) = self.persistence_backend().await {
+            let delta = DeltaShot {
+                id: record.id.clone(),
+                session_id: record.session_id.clone(),
+                branch_id: record.branch_id.clone(),
+                prev_hash: record.prev_hash.clone(),
+                hash: record.hash.clone(),
+                timestamp: u128::from(record.timestamp),
+                ops: record.ops.clone(),
+                artifacts: Vec::new(),
+                metadata: record.metadata.clone(),
+            };
+            let ops_json = match serde_json::to_vec(&record.ops) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(deltashot_id = %record.id, error = %err, "failed to serialize ops");
+                    return;
+                }
+            };
+            let compressed = compress_ops(&ops_json);
+            if let Err(err) = repo.store_deltashot(&delta, &compressed).await {
+                warn!(
+                    deltashot_id = %record.id,
+                    branch_id = %record.branch_id,
+                    error = %err,
+                    "failed to persist deltashot"
+                );
+                return;
+            }
+            let state_value = value_from_state(&record.state_snapshot);
+            if let Err(err) = repo
+                .store_branch_state(&record.branch_id, &state_value)
+                .await
+            {
+                warn!(
+                    branch_id = %record.branch_id,
+                    error = %err,
+                    "failed to persist branch state after deltashot"
+                );
+            }
+            if record.state_snapshot.version > 0
+                && record.state_snapshot.version % SNAPSHOT_INTERVAL_EVENTS == 0
+            {
+                if let Err(err) = repo
+                    .store_snapshot(
+                        &record.branch_id,
+                        record.state_snapshot.version as usize,
+                        &state_value,
+                    )
+                    .await
+                {
+                    warn!(
+                        branch_id = %record.branch_id,
+                        version = record.state_snapshot.version,
+                        error = %err,
+                        "failed to persist snapshot after deltashot"
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn create_branch(
         &self,
         session_id: &str,
@@ -1667,6 +1880,20 @@ impl ExecutionPipeline {
             ensure_session_branches(session);
             session.branches.insert(branch_id.clone(), new_branch);
         }
+        self.persist_active_branch_pointer(session_id, &branch_id)
+            .await;
+        if let Some(repo) = self.persistence_backend().await {
+            if let Err(err) = repo.register_session_branch(session_id, &branch_id).await {
+                warn!(
+                    session_id = %session_id,
+                    branch_id = %branch_id,
+                    error = %err,
+                    "failed to register created branch in persistence backend"
+                );
+            }
+        }
+        self.persist_branch_state_value(&branch_id, &parent_state)
+            .await;
 
         Ok(BranchCreateResponse {
             branch: BranchPointer {
@@ -1712,12 +1939,16 @@ impl ExecutionPipeline {
         session_id: &str,
         request: BranchSwitchRequest,
     ) -> Result<BranchSwitchResponse, PipelineError> {
+        let branch_id = request.branch_id.clone();
         let mut sessions = self.sessions.write().await;
         let session = sessions.get_mut(session_id).ok_or_else(|| {
             PipelineError::NotFound(format!("session '{}' not found", session_id))
         })?;
         ensure_session_branches(session);
         load_branch_into_session(session, &request.branch_id)?;
+        drop(sessions);
+        self.persist_active_branch_pointer(session_id, &branch_id)
+            .await;
 
         Ok(BranchSwitchResponse {
             branch_id: request.branch_id,
@@ -1731,6 +1962,8 @@ impl ExecutionPipeline {
         request: BranchMergeRequest,
     ) -> Result<BranchMergeResponse, PipelineError> {
         let strategy = request.strategy.to_ascii_lowercase();
+        let source_branch_id = request.source_branch.clone();
+        let target_branch_id = request.target_branch.clone();
         if strategy != "fast-forward" && strategy != "rebase" && strategy != "manual" {
             return Err(PipelineError::InvalidInput(
                 "strategy must be one of: fast-forward | rebase | manual".to_owned(),
@@ -1746,49 +1979,39 @@ impl ExecutionPipeline {
 
             let source = session
                 .branches
-                .get(&request.source_branch)
+                .get(&source_branch_id)
                 .cloned()
                 .ok_or_else(|| {
                     PipelineError::NotFound(format!(
                         "source branch '{}' not found",
-                        request.source_branch
+                        source_branch_id
                     ))
                 })?;
             let target = session
                 .branches
-                .get(&request.target_branch)
+                .get(&target_branch_id)
                 .cloned()
                 .ok_or_else(|| {
                     PipelineError::NotFound(format!(
                         "target branch '{}' not found",
-                        request.target_branch
+                        target_branch_id
                     ))
                 })?;
 
-            let merge_diff = compute_diff(&target.state, &source.state);
+            let merge_ops = state_ops_from_states(&target.state, &source.state);
             let new_deltashot_id = self.next_id("ds_merge");
-            let prev_hash = target.hashchain.last().cloned();
-            let digest_input = serde_json::json!({
-                "id": new_deltashot_id,
-                "session_id": session_id,
-                "event_type": "BRANCH_MERGE",
-                "strategy": strategy,
-                "source": request.source_branch,
-                "target": request.target_branch,
-                "diff": merge_diff,
-                "prev_hash": prev_hash,
-            });
-            let encoded = serde_json::to_vec(&digest_input)
+            let prev_hash = target.hashchain.last().cloned().unwrap_or_default();
+            let canonical = canonical_serialize_ops(&merge_ops)
                 .map_err(|err| PipelineError::Serialization(err.to_string()))?;
-            let hash = blake3::hash(&encoded).to_hex().to_string();
+            let hash = compute_chain_hash(&prev_hash, &canonical);
 
             let merge_event = SessionEvent {
                 id: self.next_id("evt"),
                 event_type: "BRANCH_MERGE".to_owned(),
                 payload: serde_json::json!({
-                    "source_branch": request.source_branch,
-                    "target_branch": request.target_branch,
-                    "strategy": strategy,
+                    "source_branch": source_branch_id,
+                    "target_branch": target_branch_id,
+                    "strategy": strategy.clone(),
                 }),
                 timestamp: now_ms(),
             };
@@ -1803,21 +2026,27 @@ impl ExecutionPipeline {
             merged_target.artifacts = source.artifacts.clone();
             session
                 .branches
-                .insert(request.target_branch.clone(), merged_target);
+                .insert(target_branch_id.clone(), merged_target);
 
-            if session.active_branch_id == request.target_branch {
-                load_branch_into_session(session, &request.target_branch)?;
+            if session.active_branch_id == target_branch_id {
+                load_branch_into_session(session, &target_branch_id)?;
             }
 
             DeltashotRecord {
                 id: new_deltashot_id,
                 session_id: session_id.to_owned(),
+                branch_id: target_branch_id,
                 timestamp: now_ms(),
-                event_type: EVENT_TYPE_STATE_UPDATE.to_owned(),
-                diff: merge_diff,
+                event_type: "BRANCH_MERGE".to_owned(),
+                ops: merge_ops,
                 hash,
                 prev_hash,
                 state_snapshot: source.state,
+                metadata: DeltaShotMetadata {
+                    event_type: "BRANCH_MERGE".to_owned(),
+                    agent: None,
+                    workflow_step: None,
+                },
             }
         };
 
@@ -1825,6 +2054,7 @@ impl ExecutionPipeline {
             let mut deltashots = self.deltashots.write().await;
             deltashots.insert(merge_record.id.clone(), merge_record.clone());
         }
+        self.persist_deltashot_record(&merge_record).await;
 
         Ok(BranchMergeResponse {
             status: "merged".to_owned(),
@@ -1972,16 +2202,27 @@ impl ExecutionPipeline {
 
         let prev_state = context.state.clone();
         let next_state = apply_state_mutation(&prev_state, &request.content, &agent_output);
-        let diff = compute_diff(&prev_state, &next_state);
-        let state_event = self
-            .append_event(session_id, EVENT_TYPE_STATE_UPDATE, diff.clone())
+        let ops = state_ops_from_states(&prev_state, &next_state);
+        let diff = ops_to_diff_view(&ops);
+        self.append_event(session_id, EVENT_TYPE_STATE_UPDATE, diff.clone())
             .await?;
         let deltashot = self
             .create_deltashot(
                 session_id,
                 EVENT_TYPE_STATE_UPDATE,
-                state_event.payload.clone(),
+                ops,
                 next_state.clone(),
+                DeltaShotMetadata {
+                    event_type: EVENT_TYPE_STATE_UPDATE.to_owned(),
+                    agent: Some(
+                        match agent {
+                            AgentKind::Claude => "claude",
+                            AgentKind::DeepSeek => "deepseek",
+                        }
+                        .to_owned(),
+                    ),
+                    workflow_step: next_state.step.clone(),
+                },
             )
             .await?;
 
@@ -2169,8 +2410,9 @@ impl ExecutionPipeline {
         &self,
         session_id: &str,
         event_type: &str,
-        diff: Value,
+        ops: Vec<DeltaShotOp>,
         state_snapshot: SessionState,
+        metadata: DeltaShotMetadata,
     ) -> Result<DeltashotRecord, PipelineError> {
         let mut sessions = self.sessions.write().await;
         let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
@@ -2184,29 +2426,23 @@ impl ExecutionPipeline {
 
         let id = self.next_id("ds");
         let timestamp = now_ms();
-        let prev_hash = session.hashchain.last().cloned();
-
-        let digest_input = serde_json::json!({
-            "id": id,
-            "session_id": session_id,
-            "timestamp": timestamp,
-            "event_type": event_type,
-            "prev_hash": prev_hash,
-            "diff": diff,
-        });
-        let encoded = serde_json::to_vec(&digest_input)
+        let branch_id = session.active_branch_id.clone();
+        let prev_hash = session.hashchain.last().cloned().unwrap_or_default();
+        let canonical = canonical_serialize_ops(&ops)
             .map_err(|err| PipelineError::Serialization(err.to_string()))?;
-        let hash = blake3::hash(&encoded).to_hex().to_string();
+        let hash = compute_chain_hash(&prev_hash, &canonical);
 
         let record = DeltashotRecord {
             id: id.clone(),
             session_id: session_id.to_owned(),
+            branch_id,
             timestamp,
             event_type: event_type.to_owned(),
-            diff: digest_input["diff"].clone(),
+            ops,
             hash: hash.clone(),
-            prev_hash: session.hashchain.last().cloned(),
+            prev_hash,
             state_snapshot,
+            metadata,
         };
 
         session.hashchain.push(hash);
@@ -2216,6 +2452,8 @@ impl ExecutionPipeline {
 
         let mut all = self.deltashots.write().await;
         all.insert(id, record.clone());
+        drop(all);
+        self.persist_deltashot_record(&record).await;
         Ok(record)
     }
 
@@ -2350,6 +2588,10 @@ impl ExecutionPipeline {
         ensure_session_branches(session);
         session.state = next_state;
         sync_active_branch_from_session(session);
+        let branch_id = session.active_branch_id.clone();
+        let state = session.state.clone();
+        drop(sessions);
+        self.persist_branch_state_value(&branch_id, &state).await;
         Ok(())
     }
 
@@ -2468,7 +2710,10 @@ impl ExecutionPipeline {
                 PipelineError::NotFound(format!("deltashot '{}' not found during replay", id))
             })?;
             if ds.event_type == EVENT_TYPE_STATE_UPDATE || ds.event_type == "ROLLBACK" {
-                apply_diff_to_state(&mut rebuilt, &ds.diff);
+                let value = value_from_state(&rebuilt);
+                let updated = apply_ops_to_state(&value, &ds.ops)
+                    .map_err(|err| PipelineError::Internal(err.to_string()))?;
+                rebuilt = state_from_value(updated)?;
             }
         }
         Ok(rebuilt)
@@ -2491,6 +2736,10 @@ impl ExecutionPipeline {
         Some(updates)
     }
 }
+
+// ==========================================================
+// Section 4: Runtime entrypoints + deterministic helpers
+// ==========================================================
 
 pub fn shared_pipeline() -> &'static ExecutionPipeline {
     PIPELINE.get_or_init(|| {
@@ -2621,95 +2870,81 @@ fn apply_state_mutation(
     next
 }
 
-fn compute_diff(prev: &SessionState, next: &SessionState) -> Value {
-    let mut changes = serde_json::Map::new();
-    maybe_insert_change(
-        &mut changes,
-        "goal",
-        prev.goal.clone().unwrap_or_default(),
-        next.goal.clone().unwrap_or_default(),
-    );
-    maybe_insert_change(
-        &mut changes,
-        "step",
-        prev.step.clone().unwrap_or_default(),
-        next.step.clone().unwrap_or_default(),
-    );
-    maybe_insert_change(
-        &mut changes,
-        "last_user_message",
-        prev.last_user_message.clone().unwrap_or_default(),
-        next.last_user_message.clone().unwrap_or_default(),
-    );
-    maybe_insert_change(
-        &mut changes,
-        "last_agent_message",
-        prev.last_agent_message.clone().unwrap_or_default(),
-        next.last_agent_message.clone().unwrap_or_default(),
-    );
-    maybe_insert_change(
-        &mut changes,
-        "version",
-        prev.version.to_string(),
-        next.version.to_string(),
-    );
+fn state_ops_from_states(prev: &SessionState, next: &SessionState) -> Vec<DeltaShotOp> {
+    let prev_value = value_from_state(prev);
+    let next_value = value_from_state(next);
+    compute_diff_ops(&prev_value, &next_value).unwrap_or_default()
+}
 
+fn ops_to_diff_value(ops: &[DeltaShotOp]) -> Value {
+    let mut set_count = 0usize;
+    let mut replace_count = 0usize;
+    let mut append_count = 0usize;
+    let mut delete_count = 0usize;
+    for op in ops {
+        match op.op_type {
+            OpType::Set => set_count += 1,
+            OpType::Replace => replace_count += 1,
+            OpType::Append => append_count += 1,
+            OpType::Delete => delete_count += 1,
+        }
+    }
     serde_json::json!({
         "type": EVENT_TYPE_STATE_UPDATE,
-        "changes": changes,
+        "ops": ops,
+        "summary": {
+            "set": set_count,
+            "replace": replace_count,
+            "append": append_count,
+            "delete": delete_count
+        }
     })
 }
 
-fn apply_diff_to_state(state: &mut SessionState, diff: &Value) {
-    let changes = diff
-        .get("changes")
-        .and_then(|value| value.as_object())
-        .cloned()
-        .unwrap_or_default();
+fn ops_to_diff_view(ops: &[DeltaShotOp]) -> Value {
+    ops_to_diff_value(ops)
+}
 
-    for (field, payload) in changes {
-        let to_value = payload
-            .get("to")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .to_owned();
-        match field.as_str() {
-            "goal" => {
-                state.goal = if to_value.is_empty() {
-                    None
-                } else {
-                    Some(to_value)
-                }
-            }
-            "step" => {
-                state.step = if to_value.is_empty() {
-                    None
-                } else {
-                    Some(to_value)
-                }
-            }
-            "last_user_message" => {
-                state.last_user_message = if to_value.is_empty() {
-                    None
-                } else {
-                    Some(to_value)
-                }
-            }
-            "last_agent_message" => {
-                state.last_agent_message = if to_value.is_empty() {
-                    None
-                } else {
-                    Some(to_value)
-                }
-            }
-            "version" => {
-                if let Ok(parsed) = to_value.parse::<u64>() {
-                    state.version = parsed;
-                }
-            }
-            _ => {}
-        }
-    }
+fn value_from_state(state: &SessionState) -> Value {
+    serde_json::json!({
+        "goal": state.goal,
+        "step": state.step,
+        "last_user_message": state.last_user_message,
+        "last_agent_message": state.last_agent_message,
+        "version": state.version,
+    })
+}
+
+fn state_from_value(value: Value) -> Result<SessionState, PipelineError> {
+    let object = value.as_object().ok_or_else(|| {
+        PipelineError::Serialization("state replay payload was not an object".to_owned())
+    })?;
+
+    let goal = object
+        .get("goal")
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string);
+    let step = object
+        .get("step")
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string);
+    let last_user_message = object
+        .get("last_user_message")
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string);
+    let last_agent_message = object
+        .get("last_agent_message")
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string);
+    let version = object.get("version").and_then(Value::as_u64).unwrap_or(0);
+
+    Ok(SessionState {
+        goal,
+        step,
+        last_user_message,
+        last_agent_message,
+        version,
+    })
 }
 
 fn ensure_session_branches(session: &mut SessionRecord) {
@@ -2741,13 +2976,6 @@ fn active_branch_mut(session: &mut SessionRecord) -> Result<&mut BranchRecord, P
     session
         .branches
         .get_mut(&session.active_branch_id)
-        .ok_or_else(|| PipelineError::Internal("active branch missing".to_owned()))
-}
-
-fn active_branch(session: &SessionRecord) -> Result<&BranchRecord, PipelineError> {
-    session
-        .branches
-        .get(&session.active_branch_id)
         .ok_or_else(|| PipelineError::Internal("active branch missing".to_owned()))
 }
 
@@ -2803,22 +3031,32 @@ fn stream_event<T: Serialize>(event: &str, data: T) -> StreamEventEnvelope {
     }
 }
 
-fn maybe_insert_change(
-    changes: &mut serde_json::Map<String, Value>,
-    field: &str,
-    from: String,
-    to: String,
-) {
-    if from != to {
-        changes.insert(
-            field.to_owned(),
-            serde_json::json!({
-                "from": from,
-                "to": to,
-            }),
-        );
+fn load_persistence_config() -> Option<PersistenceConfig> {
+    let redis_url = std::env::var("DELTA_AGENT_REDIS_URL").ok()?;
+    if redis_url.trim().is_empty() {
+        return None;
+    }
+    let vddab_root =
+        std::env::var("DELTA_AGENT_VDDAB_ROOT").unwrap_or_else(|_| "./data/vddab".to_owned());
+    Some(PersistenceConfig {
+        redis_url,
+        vddab_root,
+    })
+}
+
+fn compress_ops(payload: &[u8]) -> Vec<u8> {
+    let mut compressed = Vec::new();
+    let mut reader = brotli::CompressorReader::new(payload, 4096, 5, 20);
+    if reader.read_to_end(&mut compressed).is_ok() {
+        compressed
+    } else {
+        payload.to_vec()
     }
 }
+
+// ==========================================================
+// Section 5: Tests
+// ==========================================================
 
 fn now_ms() -> u64 {
     SystemTime::now()

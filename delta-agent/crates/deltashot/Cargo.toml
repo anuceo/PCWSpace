@@ -7,4 +7,7 @@ authors.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+anyhow.workspace = true
 delta-core = { path = "../core" }

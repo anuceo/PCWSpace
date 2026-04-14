@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::layout::SliceLayout;
+use crate::{deltashot_store::DeltaShotStore, snapshot_store::SnapshotStore};
 
 #[derive(Debug, Clone)]
 pub struct VddabManager {
@@ -17,5 +18,13 @@ impl VddabManager {
             branch_id: branch_id.into(),
             root: self.root.clone(),
         }
+    }
+
+    pub fn deltashot_store(&self) -> DeltaShotStore {
+        DeltaShotStore::new(self.root.clone())
+    }
+
+    pub fn snapshot_store(&self) -> SnapshotStore {
+        SnapshotStore::new(self.root.clone())
     }
 }
