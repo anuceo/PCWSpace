@@ -1,14 +1,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use delta_core::redis_schema::{
     validate_spec_integrity, RedisKeyspace, EVENT_TYPE_ARTIFACT_UPDATE, EVENT_TYPE_MESSAGE_APPEND,
-    EVENT_TYPE_STATE_UPDATE,
+    EVENT_TYPE_STATE_UPDATE, SNAPSHOT_INTERVAL_EVENTS,
 };
 use deltashot::{
-    apply_ops_to_state, canonical_serialize_ops, compute_chain_hash, compute_diff_ops,
+    apply_ops_to_state, canonical_serialize_ops, compute_chain_hash, compute_diff_ops, DeltaShot,
     DeltaShotMetadata, DeltaShotOp, OpType,
 };
 use replay::{
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
-use tracing::info;
+use tracing::{info, warn};
 
 const RECENT_MESSAGE_WINDOW: usize = 20;
 const SESSION_LOCK_TTL_SECS: u64 = 5;
@@ -29,6 +30,12 @@ const EVENT_TYPE_EXECUTION_STEP: &str = "EXECUTION_STEP";
 const MAIN_BRANCH_ID: &str = "br_main";
 
 static PIPELINE: OnceLock<ExecutionPipeline> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct PersistenceConfig {
+    redis_url: String,
+    vddab_root: String,
+}
 
 #[derive(Debug, Clone, Error)]
 pub enum PipelineError {
@@ -699,6 +706,7 @@ struct ArtifactWriteOutcome {
 #[derive(Debug)]
 pub struct ExecutionPipeline {
     keyspace: RedisKeyspace,
+    persistence: Option<PersistenceConfig>,
     id_counter: AtomicU64,
     workspaces: RwLock<HashMap<String, WorkspaceRecord>>,
     workspace_sessions: RwLock<HashMap<String, Vec<(u64, String)>>>,
@@ -724,6 +732,7 @@ impl ExecutionPipeline {
 
         Ok(Self {
             keyspace,
+            persistence: load_persistence_config(),
             id_counter: AtomicU64::new(1),
             workspaces: RwLock::new(HashMap::new()),
             workspace_sessions: RwLock::new(HashMap::new()),
@@ -1631,6 +1640,128 @@ impl ExecutionPipeline {
         })
     }
 
+    async fn persistence_backend(&self) -> Option<RedisVddabRepository> {
+        let Some(config) = self.persistence.as_ref() else {
+            return None;
+        };
+        match RedisVddabRepository::connect(
+            &config.redis_url,
+            self.keyspace.clone(),
+            &config.vddab_root,
+        )
+        .await
+        {
+            Ok(repo) => Some(repo),
+            Err(err) => {
+                warn!(error = %err, "failed to initialize persistence backend");
+                None
+            }
+        }
+    }
+
+    async fn persist_active_branch_pointer(&self, session_id: &str, branch_id: &str) {
+        if let Some(repo) = self.persistence_backend().await {
+            if let Err(err) = repo.set_session_active_branch(session_id, branch_id).await {
+                warn!(
+                    session_id = %session_id,
+                    branch_id = %branch_id,
+                    error = %err,
+                    "failed to persist active branch pointer"
+                );
+            }
+        }
+    }
+
+    async fn persist_branch_state_value(&self, branch_id: &str, state: &SessionState) {
+        if let Some(repo) = self.persistence_backend().await {
+            let value = value_from_state(state);
+            if let Err(err) = repo.store_branch_state(branch_id, &value).await {
+                warn!(
+                    branch_id = %branch_id,
+                    error = %err,
+                    "failed to persist branch state"
+                );
+                return;
+            }
+            if state.version > 0 && state.version % SNAPSHOT_INTERVAL_EVENTS == 0 {
+                if let Err(err) = repo
+                    .store_snapshot(branch_id, state.version as usize, &value)
+                    .await
+                {
+                    warn!(
+                        branch_id = %branch_id,
+                        version = state.version,
+                        error = %err,
+                        "failed to persist snapshot"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn persist_deltashot_record(&self, record: &DeltashotRecord) {
+        if let Some(repo) = self.persistence_backend().await {
+            let delta = DeltaShot {
+                id: record.id.clone(),
+                session_id: record.session_id.clone(),
+                branch_id: record.branch_id.clone(),
+                prev_hash: record.prev_hash.clone(),
+                hash: record.hash.clone(),
+                timestamp: u128::from(record.timestamp),
+                ops: record.ops.clone(),
+                artifacts: Vec::new(),
+                metadata: record.metadata.clone(),
+            };
+            let ops_json = match serde_json::to_vec(&record.ops) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(deltashot_id = %record.id, error = %err, "failed to serialize ops");
+                    return;
+                }
+            };
+            let compressed = compress_ops(&ops_json);
+            if let Err(err) = repo.store_deltashot(&delta, &compressed).await {
+                warn!(
+                    deltashot_id = %record.id,
+                    branch_id = %record.branch_id,
+                    error = %err,
+                    "failed to persist deltashot"
+                );
+                return;
+            }
+            let state_value = value_from_state(&record.state_snapshot);
+            if let Err(err) = repo
+                .store_branch_state(&record.branch_id, &state_value)
+                .await
+            {
+                warn!(
+                    branch_id = %record.branch_id,
+                    error = %err,
+                    "failed to persist branch state after deltashot"
+                );
+            }
+            if record.state_snapshot.version > 0
+                && record.state_snapshot.version % SNAPSHOT_INTERVAL_EVENTS == 0
+            {
+                if let Err(err) = repo
+                    .store_snapshot(
+                        &record.branch_id,
+                        record.state_snapshot.version as usize,
+                        &state_value,
+                    )
+                    .await
+                {
+                    warn!(
+                        branch_id = %record.branch_id,
+                        version = record.state_snapshot.version,
+                        error = %err,
+                        "failed to persist snapshot after deltashot"
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn create_branch(
         &self,
         session_id: &str,
@@ -1737,6 +1868,20 @@ impl ExecutionPipeline {
             ensure_session_branches(session);
             session.branches.insert(branch_id.clone(), new_branch);
         }
+        self.persist_active_branch_pointer(session_id, &branch_id)
+            .await;
+        if let Some(repo) = self.persistence_backend().await {
+            if let Err(err) = repo.register_session_branch(session_id, &branch_id).await {
+                warn!(
+                    session_id = %session_id,
+                    branch_id = %branch_id,
+                    error = %err,
+                    "failed to register created branch in persistence backend"
+                );
+            }
+        }
+        self.persist_branch_state_value(&branch_id, &parent_state)
+            .await;
 
         Ok(BranchCreateResponse {
             branch: BranchPointer {
@@ -1782,12 +1927,16 @@ impl ExecutionPipeline {
         session_id: &str,
         request: BranchSwitchRequest,
     ) -> Result<BranchSwitchResponse, PipelineError> {
+        let branch_id = request.branch_id.clone();
         let mut sessions = self.sessions.write().await;
         let session = sessions.get_mut(session_id).ok_or_else(|| {
             PipelineError::NotFound(format!("session '{}' not found", session_id))
         })?;
         ensure_session_branches(session);
         load_branch_into_session(session, &request.branch_id)?;
+        drop(sessions);
+        self.persist_active_branch_pointer(session_id, &branch_id)
+            .await;
 
         Ok(BranchSwitchResponse {
             branch_id: request.branch_id,
@@ -1893,6 +2042,7 @@ impl ExecutionPipeline {
             let mut deltashots = self.deltashots.write().await;
             deltashots.insert(merge_record.id.clone(), merge_record.clone());
         }
+        self.persist_deltashot_record(&merge_record).await;
 
         Ok(BranchMergeResponse {
             status: "merged".to_owned(),
@@ -2290,6 +2440,8 @@ impl ExecutionPipeline {
 
         let mut all = self.deltashots.write().await;
         all.insert(id, record.clone());
+        drop(all);
+        self.persist_deltashot_record(&record).await;
         Ok(record)
     }
 
@@ -2424,6 +2576,10 @@ impl ExecutionPipeline {
         ensure_session_branches(session);
         session.state = next_state;
         sync_active_branch_from_session(session);
+        let branch_id = session.active_branch_id.clone();
+        let state = session.state.clone();
+        drop(sessions);
+        self.persist_branch_state_value(&branch_id, &state).await;
         Ok(())
     }
 
@@ -2856,6 +3012,29 @@ fn stream_event<T: Serialize>(event: &str, data: T) -> StreamEventEnvelope {
     StreamEventEnvelope {
         event: event.to_owned(),
         data: payload,
+    }
+}
+
+fn load_persistence_config() -> Option<PersistenceConfig> {
+    let redis_url = std::env::var("DELTA_AGENT_REDIS_URL").ok()?;
+    if redis_url.trim().is_empty() {
+        return None;
+    }
+    let vddab_root =
+        std::env::var("DELTA_AGENT_VDDAB_ROOT").unwrap_or_else(|_| "./data/vddab".to_owned());
+    Some(PersistenceConfig {
+        redis_url,
+        vddab_root,
+    })
+}
+
+fn compress_ops(payload: &[u8]) -> Vec<u8> {
+    let mut compressed = Vec::new();
+    let mut reader = brotli::CompressorReader::new(payload, 4096, 5, 20);
+    if reader.read_to_end(&mut compressed).is_ok() {
+        compressed
+    } else {
+        payload.to_vec()
     }
 }
 
