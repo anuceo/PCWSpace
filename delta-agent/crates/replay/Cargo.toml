@@ -12,6 +12,8 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 brotli.workspace = true
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
 deltashot = { path = "../deltashot" }
 delta-core = { path = "../core" }
 hashing = { path = "../hashing" }
+vddab = { path = "../vddab" }

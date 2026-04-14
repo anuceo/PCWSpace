@@ -15,6 +15,7 @@ futures-util.workspace = true
 streaming = { path = "../streaming" }
 delta-core = { path = "../core" }
 deltashot = { path = "../deltashot" }
+replay = { path = "../replay" }
 uuid.workspace = true
 blake3.workspace = true
 thiserror.workspace = true

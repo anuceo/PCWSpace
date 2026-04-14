@@ -17,11 +17,11 @@ use serde::Deserialize;
 
 use crate::pipeline::{
     ApiErrorBody, ApiErrorEnvelope, ApiResponseMeta, ArtifactVersionView, ArtifactWriteRequest,
-    BranchCreateRequest, BranchListResponse, BranchMergeRequest, BranchMergeResponse,
-    BranchSwitchRequest, BranchSwitchResponse, CreateSessionRequest, CreateWorkspaceRequest,
-    DeltashotView, ExecutionTrace, ForceAgentRequest, MessageRecord, PipelineError, PipelineState,
-    RollbackRequest, SendMessageRequestV1, SessionView, StreamMessageRequestV1,
-    WorkflowStartRequest, WorkflowStepRequest,
+    BranchAuditResponse, BranchCreateRequest, BranchListResponse, BranchMergeRequest,
+    BranchMergeResponse, BranchSwitchRequest, BranchSwitchResponse, CreateSessionRequest,
+    CreateWorkspaceRequest, DeltashotView, ExecutionTrace, ForceAgentRequest, MessageRecord,
+    PipelineError, PipelineState, RollbackRequest, SendMessageRequestV1, SessionView,
+    StreamMessageRequestV1, WorkflowStartRequest, WorkflowStepRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +68,7 @@ pub fn router() -> Router<Arc<PipelineState>> {
         .route("/sessions/{sessionId}/agent", post(force_agent_selection))
         .route("/sessions/{sessionId}/agents/logs", get(get_agent_logs))
         .route("/sessions/{sessionId}/trace", get(get_trace))
+        .route("/debug/branches/{branchId}/audit", post(run_branch_audit))
         .route("/sessions/{sessionId}/branch", post(create_branch))
         .route("/sessions/{sessionId}/branches", get(list_branches))
         .route("/sessions/{sessionId}/branch/switch", post(switch_branch))
@@ -299,6 +300,17 @@ async fn get_trace(
     with_meta(async move {
         let trace = state.get_trace(&session_id).await;
         Ok::<ExecutionTrace, PipelineError>(trace)
+    })
+    .await
+}
+
+async fn run_branch_audit(
+    Path(branch_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    with_meta(async move {
+        let report = state.debug_audit_branch(&branch_id).await?;
+        Ok::<BranchAuditResponse, PipelineError>(report)
     })
     .await
 }

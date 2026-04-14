@@ -11,6 +11,10 @@ use deltashot::{
     apply_ops_to_state, canonical_serialize_ops, compute_chain_hash, compute_diff_ops,
     DeltaShotMetadata, DeltaShotOp, OpType,
 };
+use replay::{
+    adapters::RedisVddabRepository,
+    verifier::{audit_replay, verify_chain, ReplayAuditResult, VerificationResult},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -367,6 +371,14 @@ pub struct ExecutionTrace {
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchAuditResponse {
+    pub branch_id: String,
+    pub valid: bool,
+    pub chain: VerificationResult,
+    pub replay: ReplayAuditResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1588,6 +1600,35 @@ impl ExecutionPipeline {
         HealthResponse {
             status: "ok".to_owned(),
         }
+    }
+
+    pub async fn debug_audit_branch(
+        &self,
+        branch_id: &str,
+    ) -> Result<BranchAuditResponse, PipelineError> {
+        let redis_url = std::env::var("DELTA_AGENT_REDIS_URL").map_err(|_| {
+            PipelineError::InvalidInput("DELTA_AGENT_REDIS_URL is not set".to_owned())
+        })?;
+        let vddab_root =
+            std::env::var("DELTA_AGENT_VDDAB_ROOT").unwrap_or_else(|_| "./data/vddab".to_owned());
+
+        let repo = RedisVddabRepository::connect(&redis_url, self.keyspace.clone(), vddab_root)
+            .await
+            .map_err(|err| PipelineError::Internal(format!("audit backend init failed: {err}")))?;
+
+        let chain = verify_chain(&repo, branch_id)
+            .await
+            .map_err(|err| PipelineError::Internal(format!("chain audit failed: {err}")))?;
+        let replay = audit_replay(&repo, &repo, branch_id)
+            .await
+            .map_err(|err| PipelineError::Internal(format!("replay audit failed: {err}")))?;
+
+        Ok(BranchAuditResponse {
+            branch_id: branch_id.to_owned(),
+            valid: chain.valid && replay.valid,
+            chain,
+            replay,
+        })
     }
 
     pub async fn create_branch(

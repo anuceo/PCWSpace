@@ -4,10 +4,11 @@ use std::sync::RwLock;
 
 use anyhow::Result;
 use deltashot::{apply_ops, canonical_serialize_ops, compute_chain_hash, DeltaShot, Op};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, error};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationResult {
     pub valid: bool,
     pub verified_count: usize,
@@ -15,7 +16,7 @@ pub struct VerificationResult {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayAuditResult {
     pub valid: bool,
     pub final_state_match: bool,
