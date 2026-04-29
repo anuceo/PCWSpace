@@ -37,6 +37,16 @@ pub fn build_router() -> Router {
     Router::new()
         .route("/health", get(health))
         .nest("/api/v1", protected)
+        .fallback(handler_404)
+}
+
+async fn handler_404() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({"ok": false, "error": "not found"})),
+    )
+        .into_response()
 }
 
 async fn health() -> axum::Json<serde_json::Value> {

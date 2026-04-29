@@ -117,11 +117,13 @@ fn save_env_map(path: &str, map: &HashMap<String, String>) {
     let _ = std::fs::write(path, output);
 }
 
+const SKIPPED: &str = "__SKIPPED__";
+
 fn get_env(key: &str, map: &HashMap<String, String>) -> String {
     std::env::var(key)
         .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| map.get(key).filter(|v| !v.is_empty()).cloned())
+        .filter(|v| !v.is_empty() && v != SKIPPED)
+        .or_else(|| map.get(key).filter(|v| !v.is_empty() && v.as_str() != SKIPPED).cloned())
         .unwrap_or_default()
 }
 
@@ -173,8 +175,6 @@ fn connect_wifi(ssid: &str, password: &str) -> bool {
 }
 
 async fn network_setup_flow() {
-    println!("{BOLD}Network Connectivity{RESET}");
-
     if check_internet().await {
         ok("Internet reachable");
         return;
@@ -245,7 +245,6 @@ async fn network_setup_flow() {
 // ── API key verification ──────────────────────────────────────────────────────
 
 async fn verify_redis(url: &str) -> Result<String, String> {
-    use redis::AsyncCommands;
     let client = redis::Client::open(url).map_err(|e| e.to_string())?;
     let mut conn = client
         .get_multiplexed_async_connection()
@@ -358,6 +357,12 @@ fn collect_missing_keys(env_map: &mut HashMap<String, String>) -> bool {
     println!("{BOLD}Configuration{RESET}");
 
     for spec in KEY_SPECS {
+        let raw_stored = env_map.get(spec.env_key).map(|s| s.as_str()).unwrap_or("");
+        if raw_stored == SKIPPED {
+            println!("  {DIM}skipped           {:<28}{RESET}", spec.env_key);
+            continue;
+        }
+
         let current = get_env(spec.env_key, env_map);
         if !current.is_empty() {
             let display = if spec.secret {
@@ -392,6 +397,11 @@ fn collect_missing_keys(env_map: &mut HashMap<String, String>) -> bool {
             any_prompted = true;
         } else if spec.required {
             warn(&format!("{} is required — some features will fail", spec.env_key));
+        } else {
+            // Record that the user explicitly skipped this optional key so we
+            // don't prompt again on the next run.
+            env_map.insert(spec.env_key.to_string(), SKIPPED.to_string());
+            any_prompted = true;
         }
     }
 

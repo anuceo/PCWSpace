@@ -26,6 +26,14 @@ async fn main() {
         .await
         .expect("Failed to bind — is the port already in use?");
 
+    // Spawn background workflow worker
+    let redis_url = cfg.redis_url.clone();
+    tokio::spawn(async move {
+        if let Err(e) = runtime::scheduler::run_workflow_worker_loop(&redis_url, 1).await {
+            tracing::error!(error = %e, "Workflow worker loop exited");
+        }
+    });
+
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await

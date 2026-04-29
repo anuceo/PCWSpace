@@ -60,6 +60,13 @@ impl Orchestrator {
     ) -> PcwResult<AgentResult> {
         // 1. Load state
         let mut session = Self::load_session(session_id, conn).await?;
+
+        if session.status == SessionStatus::Closed {
+            return Err(PcwError::InvalidInput(format!(
+                "session {session_id} is closed and cannot accept new messages"
+            )));
+        }
+
         let before = session.to_state_object();
 
         // 2. Analyze & select agent
