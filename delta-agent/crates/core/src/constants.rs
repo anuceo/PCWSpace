@@ -1,2 +1,0 @@
-pub const DEFAULT_STREAM_BUFFER: usize = 1024;
-pub const DEFAULT_BRANCH_PRIORITY: i32 = 100;
