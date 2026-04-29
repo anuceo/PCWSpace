@@ -59,6 +59,15 @@ pub async fn new_version(
         .await
         .map_err(|e| PcwError::RedisError(e.to_string()))?;
 
+    // Keep the session artifact set up to date (v1 was added on create; add new versions too)
+    if let Some(ref session_id) = new_artifact.linked_session {
+        let ses_key = infra::redis_client::key_session_artifacts(session_id);
+        let _: () = conn
+            .sadd(&ses_key, &new_artifact.artifact_id)
+            .await
+            .map_err(|e| PcwError::RedisError(e.to_string()))?;
+    }
+
     Ok(new_artifact)
 }
 

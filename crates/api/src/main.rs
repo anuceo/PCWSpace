@@ -3,9 +3,16 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() {
-    // Load env + init logging
+    // Determine .env path — look next to binary, then cwd
+    let env_path = find_env_file();
+
+    // Run startup checks: network → key prompting → live verification
+    api::startup::run_checks(&env_path).await;
+
+    // Init structured logging AFTER startup (startup uses plain println for UX)
     infra::logging::init_logging();
 
+    // Settings are now fully populated (startup may have set env vars)
     let cfg = pcw_core::config::get_settings();
     let addr: SocketAddr = format!("{}:{}", cfg.pcw_host, cfg.pcw_port)
         .parse()
@@ -17,7 +24,15 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .expect("Failed to bind");
+        .expect("Failed to bind — is the port already in use?");
+
+    // Spawn background workflow worker
+    let redis_url = cfg.redis_url.clone();
+    tokio::spawn(async move {
+        if let Err(e) = runtime::scheduler::run_workflow_worker_loop(&redis_url, 1).await {
+            tracing::error!(error = %e, "Workflow worker loop exited");
+        }
+    });
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
@@ -25,9 +40,26 @@ async fn main() {
         .expect("Server error");
 }
 
+fn find_env_file() -> String {
+    // 1. Explicit override via env var
+    if let Ok(p) = std::env::var("PCW_ENV_FILE") {
+        return p;
+    }
+    // 2. .env next to the executable
+    if let Ok(mut exe) = std::env::current_exe() {
+        exe.pop();
+        exe.push(".env");
+        if exe.exists() {
+            return exe.to_string_lossy().into_owned();
+        }
+    }
+    // 3. .env in current working directory (default)
+    ".env".to_string()
+}
+
 async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
-        .expect("Failed to install CTRL+C handler");
-    info!("Shutdown signal received");
+        .expect("Failed to install Ctrl+C handler");
+    tracing::info!("Shutdown signal received — stopping server");
 }

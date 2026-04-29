@@ -11,7 +11,12 @@ const SIGN_KEY_SUFFIX: &str = ":signing";
 async fn get_or_create_key(redis_key: &str, ttl: u64, conn: &mut MultiplexedConnection) -> PcwResult<Vec<u8>> {
     let raw: Option<Vec<u8>> = conn.get(redis_key).await
         .map_err(|e| PcwError::RedisError(e.to_string()))?;
-    if let Some(k) = raw { return Ok(k); }
+    if let Some(k) = raw {
+        // Slide the TTL window on every access so active sessions never expire mid-use
+        let _: () = conn.expire(redis_key, ttl as i64).await
+            .map_err(|e| PcwError::RedisError(e.to_string()))?;
+        return Ok(k);
+    }
     let new_key = encryption::generate_key();
     let _: () = conn.set_ex(redis_key, new_key.as_slice(), ttl).await
         .map_err(|e| PcwError::RedisError(e.to_string()))?;
