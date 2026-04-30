@@ -1,0 +1,28 @@
+# Podman Quadlet — Storm Nimbus (master)
+[Unit]
+Description=PCW Storm Nimbus
+After=pcw-zookeeper.service
+Requires=pcw-zookeeper.service
+
+[Container]
+Image=docker.io/storm:2.6
+ContainerName=pcw-storm-nimbus
+Network=pcw.network
+Volume=pcw-storm.volume:/storm/data
+Volume=%h/.config/pcw/storm.yaml:/conf/storm.yaml:ro,z
+PublishPort=6627:6627
+PublishPort=8080:8080
+Exec=storm nimbus
+
+HealthCmd=storm list
+HealthInterval=20s
+HealthRetries=5
+HealthTimeout=10s
+HealthStartPeriod=30s
+
+[Service]
+Restart=on-failure
+RestartSec=15s
+
+[Install]
+WantedBy=default.target

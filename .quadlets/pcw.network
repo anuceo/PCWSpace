@@ -1,0 +1,4 @@
+# Podman Quadlet — shared bridge network for all PCW containers
+[Network]
+Subnet=10.89.0.0/24
+Gateway=10.89.0.1

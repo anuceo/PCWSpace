@@ -26,13 +26,22 @@ async fn main() {
         .await
         .expect("Failed to bind — is the port already in use?");
 
-    // Spawn background workflow worker
-    let redis_url = cfg.redis_url.clone();
-    tokio::spawn(async move {
-        if let Err(e) = runtime::scheduler::run_workflow_worker_loop(&redis_url, 1).await {
-            tracing::error!(error = %e, "Workflow worker loop exited");
-        }
-    });
+    // Try Storm first; fall back to the in-process Redis poller if unavailable.
+    let redis_url    = cfg.redis_url.clone();
+    let nimbus_url   = std::env::var("STORM_NIMBUS_URL")
+        .unwrap_or_else(|_| "http://storm-nimbus:8080".to_string());
+    let worker_bin   = std::env::var("PCW_STORM_WORKER_BIN")
+        .unwrap_or_else(|_| "pcw-storm-worker".to_string());
+
+    let storm_active = runtime::scheduler::submit_storm_topology(&nimbus_url, &worker_bin).await;
+
+    if !storm_active {
+        tokio::spawn(async move {
+            if let Err(e) = runtime::scheduler::run_workflow_worker_loop(&redis_url, 1).await {
+                tracing::error!(error = %e, "Workflow worker loop exited");
+            }
+        });
+    }
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())

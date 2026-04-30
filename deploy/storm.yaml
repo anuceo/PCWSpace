@@ -1,0 +1,27 @@
+# Storm cluster configuration for PCW
+# Mounted read-only into both nimbus and supervisor containers.
+
+storm.zookeeper.servers:
+  - "zookeeper"
+storm.zookeeper.port: 2181
+
+nimbus.seeds:
+  - "storm-nimbus"
+
+storm.local.dir: "/storm/data"
+
+# Supervisor slots — each slot is one worker JVM process
+supervisor.slots.ports:
+  - 6700
+  - 6701
+  - 6702
+  - 6703
+
+# Multilang subprocess settings
+topology.multilang.serializer: "org.apache.storm.multilang.JsonSerializer"
+
+# Worker heap — bolt/spout processes are Rust so the JVM wrapper stays lean
+worker.heap.memory.mb: 256
+
+# Logging
+storm.log.dir: "/storm/logs"

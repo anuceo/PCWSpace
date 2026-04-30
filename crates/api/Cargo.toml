@@ -7,6 +7,10 @@ edition.workspace   = true
 name = "pcw"
 path = "src/main.rs"
 
+[[bin]]
+name = "pcw-storm-worker"
+path = "src/bin/storm_worker.rs"
+
 [dependencies]
 pcw_core = { path = "../core" }
 deltashots   = { path = "../deltashots" }
@@ -16,6 +20,7 @@ artifacts    = { path = "../artifacts" }
 workflows    = { path = "../workflows" }
 runtime      = { path = "../runtime" }
 intelligence = { path = "../intelligence" }
+storm        = { path = "../storm" }
 audit        = { path = "../audit" }
 timeline     = { path = "../timeline" }
 axum         = { workspace = true }

@@ -1,0 +1,136 @@
+# PCW full-stack — Podman Compose
+# Run with: podman-compose up -d
+#
+# Services:
+#   redis          — session/artifact/deltashot persistence
+#   zookeeper      — Storm cluster coordination
+#   storm-nimbus   — Storm master: topology submission & supervision
+#   storm-supervisor — Storm worker node: runs bolt/spout processes
+#   pcw-api        — PCW REST API + startup wizard
+
+version: "3.9"
+
+networks:
+  pcw-net:
+    driver: bridge
+
+volumes:
+  redis-data:
+  zookeeper-data:
+  storm-data:
+
+services:
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: docker.io/redis:7-alpine
+    container_name: pcw-redis
+    restart: unless-stopped
+    networks: [pcw-net]
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── ZooKeeper (Storm coordination) ────────────────────────────────────────
+  zookeeper:
+    image: docker.io/zookeeper:3.9
+    container_name: pcw-zookeeper
+    restart: unless-stopped
+    networks: [pcw-net]
+    volumes:
+      - zookeeper-data:/data
+    environment:
+      ZOO_MY_ID: 1
+      ZOO_STANDALONE_ENABLED: "true"
+    healthcheck:
+      test: ["CMD", "zkServer.sh", "status"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ── Storm Nimbus (master) ──────────────────────────────────────────────────
+  storm-nimbus:
+    image: docker.io/storm:2.6
+    container_name: pcw-storm-nimbus
+    restart: unless-stopped
+    networks: [pcw-net]
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    volumes:
+      - storm-data:/storm/data
+      - ./deploy/storm.yaml:/conf/storm.yaml:ro
+    command: storm nimbus
+    ports:
+      - "6627:6627"   # Nimbus Thrift
+      - "8080:8080"   # Nimbus REST UI
+    healthcheck:
+      test: ["CMD", "storm", "list"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Storm Supervisor (worker node) ────────────────────────────────────────
+  storm-supervisor:
+    image: docker.io/storm:2.6
+    container_name: pcw-storm-supervisor
+    restart: unless-stopped
+    networks: [pcw-net]
+    depends_on:
+      storm-nimbus:
+        condition: service_healthy
+    volumes:
+      - storm-data:/storm/data
+      - ./deploy/storm.yaml:/conf/storm.yaml:ro
+      # Mount the PCW worker binary so Storm can exec it
+      - ./target/release/pcw-storm-worker:/usr/local/bin/pcw-storm-worker:ro
+    command: storm supervisor
+    environment:
+      RUST_LOG: info
+
+  # ── PCW API ───────────────────────────────────────────────────────────────
+  pcw-api:
+    image: localhost/pcw:latest
+    container_name: pcw-api
+    build:
+      context: .
+      containerfile: Containerfile
+    restart: unless-stopped
+    networks: [pcw-net]
+    depends_on:
+      redis:
+        condition: service_healthy
+      storm-nimbus:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL:              redis://redis:6379
+      STORM_NIMBUS_URL:       http://storm-nimbus:8080
+      PCW_STORM_WORKER_BIN:  /usr/local/bin/pcw-storm-worker
+      PCW_HOST:               0.0.0.0
+      PCW_PORT:               "8000"
+      PCW_LOG_LEVEL:          info
+      # Secrets — override with a podman secret or .env file at deploy time
+      ANTHROPIC_API_KEY:      ${ANTHROPIC_API_KEY:-}
+      PCW_API_KEY:            ${PCW_API_KEY:-dev-insecure}
+      DEEPSEEK_API_KEY:       ${DEEPSEEK_API_KEY:-}
+      NOTION_TOKEN:           ${NOTION_TOKEN:-}
+      NOTION_DATABASE_ID:     ${NOTION_DATABASE_ID:-}
+      NOTION_ARTIFACTS_DATABASE_ID: ${NOTION_ARTIFACTS_DATABASE_ID:-}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

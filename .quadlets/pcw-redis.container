@@ -1,0 +1,28 @@
+# Podman Quadlet — Redis
+# Install to: ~/.config/containers/systemd/
+# Enable with: systemctl --user daemon-reload && systemctl --user enable --now pcw-redis
+
+[Unit]
+Description=PCW Redis
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=docker.io/redis:7-alpine
+ContainerName=pcw-redis
+Network=pcw.network
+Volume=pcw-redis.volume:/data
+PublishPort=6379:6379
+Exec=redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+
+HealthCmd=redis-cli ping
+HealthInterval=10s
+HealthRetries=5
+HealthTimeout=5s
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=default.target

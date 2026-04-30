@@ -1,0 +1,33 @@
+# Podman Quadlet — PCW API
+[Unit]
+Description=PCW API Server
+After=pcw-redis.service pcw-storm-nimbus.service
+Requires=pcw-redis.service
+
+[Container]
+Image=localhost/pcw:latest
+ContainerName=pcw-api
+Network=pcw.network
+PublishPort=8000:8000
+
+# Secrets — populate via: podman secret create pcw-env /path/to/.env
+EnvironmentFile=%h/.config/pcw/pcw.env
+
+Environment=REDIS_URL=redis://pcw-redis:6379
+Environment=STORM_NIMBUS_URL=http://pcw-storm-nimbus:8080
+Environment=PCW_STORM_WORKER_BIN=/usr/local/bin/pcw-storm-worker
+Environment=PCW_HOST=0.0.0.0
+Environment=PCW_PORT=8000
+
+HealthCmd=curl -sf http://localhost:8000/health
+HealthInterval=15s
+HealthRetries=5
+HealthTimeout=5s
+HealthStartPeriod=20s
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,23 @@
+# Podman Quadlet — Storm Supervisor (worker node)
+[Unit]
+Description=PCW Storm Supervisor
+After=pcw-storm-nimbus.service
+Requires=pcw-storm-nimbus.service
+
+[Container]
+Image=docker.io/storm:2.6
+ContainerName=pcw-storm-supervisor
+Network=pcw.network
+Volume=pcw-storm.volume:/storm/data
+Volume=%h/.config/pcw/storm.yaml:/conf/storm.yaml:ro,z
+# Mount the compiled Rust storm worker binary
+Volume=%h/.local/bin/pcw-storm-worker:/usr/local/bin/pcw-storm-worker:ro,z
+Exec=storm supervisor
+Environment=RUST_LOG=info
+
+[Service]
+Restart=on-failure
+RestartSec=15s
+
+[Install]
+WantedBy=default.target

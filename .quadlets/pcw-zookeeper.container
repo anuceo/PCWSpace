@@ -1,0 +1,25 @@
+# Podman Quadlet — ZooKeeper (Storm coordination)
+[Unit]
+Description=PCW ZooKeeper
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=docker.io/zookeeper:3.9
+ContainerName=pcw-zookeeper
+Network=pcw.network
+Volume=pcw-zookeeper.volume:/data
+Environment=ZOO_MY_ID=1
+Environment=ZOO_STANDALONE_ENABLED=true
+
+HealthCmd=zkServer.sh status
+HealthInterval=15s
+HealthRetries=5
+HealthTimeout=10s
+
+[Service]
+Restart=on-failure
+RestartSec=15s
+
+[Install]
+WantedBy=default.target
