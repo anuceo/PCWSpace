@@ -92,3 +92,157 @@ pub fn diff_to_bytes(diff: &Value) -> Vec<u8> {
 pub fn bytes_to_diff(bytes: &[u8]) -> pcw_core::errors::PcwResult<Value> {
     serde_json::from_slice(bytes).map_err(|e| pcw_core::errors::PcwError::SerializationError(e.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── compute_diff ──────────────────────────────────────────────────────
+
+    #[test]
+    fn identical_values_produce_empty_diff() {
+        let v = json!({"a": 1, "b": "hello"});
+        assert!(is_diff_empty(&compute_diff(&v, &v)));
+    }
+
+    #[test]
+    fn added_field_detected() {
+        let before = json!({"a": 1});
+        let after  = json!({"a": 1, "b": 2});
+        let diff = compute_diff(&before, &after);
+        assert_eq!(diff["added"]["b"], json!(2));
+        assert!(diff.get("removed").is_none());
+    }
+
+    #[test]
+    fn removed_field_detected() {
+        let before = json!({"a": 1, "b": 2});
+        let after  = json!({"a": 1});
+        let diff = compute_diff(&before, &after);
+        assert_eq!(diff["removed"]["b"], json!(2));
+        assert!(diff.get("added").is_none());
+    }
+
+    #[test]
+    fn changed_field_detected() {
+        let before = json!({"x": "old"});
+        let after  = json!({"x": "new"});
+        let diff = compute_diff(&before, &after);
+        // Changed holds a nested diff for the field
+        assert!(diff["changed"]["x"].is_object());
+        assert!(diff.get("added").is_none());
+        assert!(diff.get("removed").is_none());
+    }
+
+    #[test]
+    fn nested_object_change_detected() {
+        let before = json!({"user": {"score": 10}});
+        let after  = json!({"user": {"score": 20}});
+        let diff = compute_diff(&before, &after);
+        // Changed → user → nested diff for score
+        assert!(diff["changed"]["user"].is_object());
+    }
+
+    #[test]
+    fn scalar_values_use_before_after_format() {
+        let diff = compute_diff(&json!("v1"), &json!("v2"));
+        assert_eq!(diff["before"], json!("v1"));
+        assert_eq!(diff["after"],  json!("v2"));
+    }
+
+    // ── apply_diff ────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_adds_field() {
+        let mut state = json!({"a": 1});
+        apply_diff(&mut state, &json!({"added": {"b": 99}}));
+        assert_eq!(state["b"], json!(99));
+        assert_eq!(state["a"], json!(1));
+    }
+
+    #[test]
+    fn apply_removes_field() {
+        let mut state = json!({"a": 1, "b": 2});
+        apply_diff(&mut state, &json!({"removed": {"b": 2}}));
+        assert!(state.get("b").is_none());
+        assert_eq!(state["a"], json!(1));
+    }
+
+    #[test]
+    fn apply_changes_scalar_field() {
+        let mut state = json!({"x": "old"});
+        // Scalar changes use the before/after sub-diff
+        apply_diff(&mut state, &json!({"changed": {"x": {"before": "old", "after": "new"}}}));
+        assert_eq!(state["x"], json!("new"));
+    }
+
+    #[test]
+    fn empty_diff_is_noop() {
+        let mut state = json!({"keep": "this"});
+        let original = state.clone();
+        apply_diff(&mut state, &json!({}));
+        assert_eq!(state, original);
+    }
+
+    // ── roundtrip ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn roundtrip_add_remove_change() {
+        let before = json!({"a": 1, "b": "old", "c": true});
+        let after  = json!({"a": 1, "b": "new", "d": 99});
+        let diff = compute_diff(&before, &after);
+        let mut state = before.clone();
+        apply_diff(&mut state, &diff);
+        assert_eq!(state, after);
+    }
+
+    #[test]
+    fn roundtrip_nested_objects() {
+        let before = json!({"user": {"name": "Alice", "score": 10}, "active": true});
+        let after  = json!({"user": {"name": "Alice", "score": 20}, "active": true, "badge": "gold"});
+        let diff = compute_diff(&before, &after);
+        let mut state = before.clone();
+        apply_diff(&mut state, &diff);
+        assert_eq!(state, after);
+    }
+
+    #[test]
+    fn roundtrip_scalar_replace() {
+        let before = json!("version_a");
+        let after  = json!("version_b");
+        let diff = compute_diff(&before, &after);
+        let mut val = before.clone();
+        apply_diff(&mut val, &diff);
+        assert_eq!(val, after);
+    }
+
+    #[test]
+    fn roundtrip_session_state_shape() {
+        let before = json!({"session_id": "s1", "messages": [], "status": "active"});
+        let after  = json!({
+            "session_id": "s1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "status": "active",
+            "turn_count": 1
+        });
+        let diff = compute_diff(&before, &after);
+        let mut state = before.clone();
+        apply_diff(&mut state, &diff);
+        assert_eq!(state, after);
+    }
+
+    // ── serialisation ─────────────────────────────────────────────────────
+
+    #[test]
+    fn diff_bytes_roundtrip() {
+        let diff = json!({"added": {"x": 1}, "removed": {"y": 2}});
+        let bytes = diff_to_bytes(&diff);
+        assert_eq!(bytes_to_diff(&bytes).unwrap(), diff);
+    }
+
+    #[test]
+    fn bytes_to_diff_rejects_invalid_json() {
+        assert!(bytes_to_diff(b"not valid json {{{{").is_err());
+    }
+}

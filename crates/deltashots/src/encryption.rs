@@ -46,3 +46,83 @@ pub fn decrypt(packed: &[u8], key: &[u8]) -> PcwResult<Vec<u8>> {
         .decrypt(nonce, ciphertext_with_tag)
         .map_err(|e| PcwError::EncryptionFailed(e.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_arbitrary_plaintext() {
+        let key = generate_key();
+        let pt = b"hello world, this is a test payload";
+        assert_eq!(decrypt(&encrypt(pt, &key).unwrap(), &key).unwrap(), pt);
+    }
+
+    #[test]
+    fn roundtrip_empty_plaintext() {
+        let key = generate_key();
+        let pt: &[u8] = b"";
+        assert_eq!(decrypt(&encrypt(pt, &key).unwrap(), &key).unwrap(), pt);
+    }
+
+    #[test]
+    fn roundtrip_large_plaintext() {
+        let key = generate_key();
+        let pt = vec![0xABu8; 64 * 1024]; // 64 KiB
+        assert_eq!(decrypt(&encrypt(&pt, &key).unwrap(), &key).unwrap(), pt);
+    }
+
+    #[test]
+    fn wrong_key_fails_auth() {
+        let key1 = generate_key();
+        let key2 = generate_key();
+        let ct = encrypt(b"secret", &key1).unwrap();
+        assert!(decrypt(&ct, &key2).is_err());
+    }
+
+    #[test]
+    fn truncated_payload_rejected() {
+        let key = generate_key();
+        // One byte shorter than the minimum IV+TAG
+        let short = vec![0u8; IV_LEN + TAG_LEN - 1];
+        assert!(decrypt(&short, &key).is_err());
+    }
+
+    #[test]
+    fn each_encrypt_uses_unique_iv() {
+        let key = generate_key();
+        let pt = b"same plaintext";
+        let ct1 = encrypt(pt, &key).unwrap();
+        let ct2 = encrypt(pt, &key).unwrap();
+        // Distinct IVs produce distinct ciphertexts
+        assert_ne!(ct1, ct2);
+    }
+
+    #[test]
+    fn bitflip_in_ciphertext_fails_auth() {
+        let key = generate_key();
+        let mut ct = encrypt(b"authenticated data", &key).unwrap();
+        // Corrupt a byte in the ciphertext (past the IV)
+        ct[IV_LEN] ^= 0xFF;
+        assert!(decrypt(&ct, &key).is_err());
+    }
+
+    #[test]
+    fn bitflip_in_tag_fails_auth() {
+        let key = generate_key();
+        let pt = b"tag integrity check";
+        let mut ct = encrypt(pt, &key).unwrap();
+        // Corrupt the last byte (inside the auth tag)
+        let last = ct.len() - 1;
+        ct[last] ^= 0x01;
+        assert!(decrypt(&ct, &key).is_err());
+    }
+
+    #[test]
+    fn output_length_is_iv_plus_plaintext_plus_tag() {
+        let key = generate_key();
+        let pt = b"fixed length test";
+        let ct = encrypt(pt, &key).unwrap();
+        assert_eq!(ct.len(), IV_LEN + pt.len() + TAG_LEN);
+    }
+}
