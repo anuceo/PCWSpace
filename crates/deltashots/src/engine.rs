@@ -99,10 +99,14 @@ pub async fn append_deltashot(
 }
 
 pub async fn get_decrypted_diff(shot: &DeltaShot, conn: &mut MultiplexedConnection) -> PcwResult<Value> {
+    let ttl = pcw_core::config::get_settings().session_key_ttl_secs;
     let enc_key_redis = format!("{ENC_KEY_PREFIX}:{}", shot.session_id);
     let enc_key: Option<Vec<u8>> = conn.get(&enc_key_redis).await
         .map_err(|e| PcwError::RedisError(e.to_string()))?;
     let enc_key = enc_key.ok_or_else(|| PcwError::EncryptionKeyNotFound(shot.session_id.clone()))?;
+    // Slide the TTL on reads too — a long replay must not expire the key mid-stream
+    let _: () = conn.expire(&enc_key_redis, ttl as i64).await
+        .map_err(|e| PcwError::RedisError(e.to_string()))?;
     let plaintext = encryption::decrypt(&shot.diff_payload, &enc_key)?;
     diff::bytes_to_diff(&plaintext)
 }

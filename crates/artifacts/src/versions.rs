@@ -7,6 +7,10 @@ use redis::AsyncCommands;
 use sha2::{Digest, Sha256};
 use tracing::instrument;
 
+/// Intermediate version snapshots expire this long after being superseded.
+/// The root artifact (version 1) is exempt — it is the permanent metadata anchor.
+const STALE_SNAPSHOT_TTL_SECS: i64 = 7 * 24 * 3600; // 7 days
+
 /// Create a new version of an existing artifact.
 #[instrument(skip(conn))]
 pub async fn new_version(
@@ -58,6 +62,24 @@ pub async fn new_version(
         .rpush(&ver_key, &new_artifact.artifact_id)
         .await
         .map_err(|e| PcwError::RedisError(e.to_string()))?;
+
+    // Read the outgoing latest before we advance it
+    let outgoing_latest: Option<String> = conn
+        .get(key_artifact_latest(parent_id))
+        .await
+        .unwrap_or(None);
+
+    // Schedule expiry on the snapshot being superseded.
+    // Skip the root (parent_id == outgoing) — it holds canonical name/type/session metadata
+    // and must never expire while the chain exists.
+    if let Some(ref prev_id) = outgoing_latest {
+        if prev_id != parent_id {
+            let _: () = conn
+                .expire(key_artifact(prev_id), STALE_SNAPSHOT_TTL_SECS)
+                .await
+                .map_err(|e| PcwError::RedisError(e.to_string()))?;
+        }
+    }
 
     // Advance the latest pointer so list_for_session always resolves to current content.
     // parent_id is treated as the root — callers must pass the root artifact ID.
