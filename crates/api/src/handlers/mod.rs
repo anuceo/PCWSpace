@@ -24,6 +24,7 @@ pub fn map_err(e: pcw_core::errors::PcwError) -> (StatusCode, Json<Value>) {
             StatusCode::NOT_FOUND
         }
         InvalidInput(_) | InvalidTransition { .. } => StatusCode::BAD_REQUEST,
+        BatonDropped(_) => StatusCode::FORBIDDEN,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(json!({"ok": false, "error": e.to_string()})))

@@ -15,14 +15,21 @@ const STALE_SNAPSHOT_TTL_SECS: i64 = 7 * 24 * 3600; // 7 days
 /// `parent_id` must be the **root** artifact ID (version 1). Every version in
 /// the chain is anchored there: the version list, the latest pointer, and the
 /// stale-snapshot TTL logic all key off the root.
+/// `session_id` — if provided and the root has a baton, must match the session
+/// that created the root, or the baton is dropped and the call is rejected.
 #[instrument(skip(conn))]
 pub async fn new_version(
     parent_id: &str,
     new_content: &str,
     agent_type: Option<AgentType>,
     deltashot_id: Option<&str>,
+    session_id: Option<&str>,
     conn: &mut redis::aio::MultiplexedConnection,
 ) -> PcwResult<Artifact> {
+    // Baton check — verify the connection point before any write
+    if let Some(sid) = session_id {
+        crate::baton::verify(parent_id, sid, conn).await?;
+    }
     // Load root for stable metadata (name, type, linked_session)
     let root: Artifact = {
         let raw: Option<String> = conn

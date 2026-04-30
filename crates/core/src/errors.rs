@@ -55,6 +55,9 @@ pub enum PcwError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("Baton dropped: {0}")]
+    BatonDropped(String),
 }
 
 pub type PcwResult<T> = Result<T, PcwError>;

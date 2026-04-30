@@ -16,6 +16,7 @@ pub struct CreateArtifactBody {
 #[derive(Deserialize)]
 pub struct NewVersionBody {
     pub content: String,
+    pub session_id: Option<String>,
 }
 
 fn parse_type(t: &str) -> ArtifactType {
@@ -65,7 +66,7 @@ pub async fn new_artifact_version(
     Json(body): Json<NewVersionBody>,
 ) -> ApiResult {
     let mut conn = get_multiplexed_connection().await.map_err(map_err)?;
-    let artifact = versions::new_version(&artifact_id, &body.content, None, None, &mut conn)
+    let artifact = versions::new_version(&artifact_id, &body.content, None, None, body.session_id.as_deref(), &mut conn)
         .await
         .map_err(map_err)?;
     ok(artifact)

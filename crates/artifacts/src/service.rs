@@ -46,6 +46,9 @@ impl ArtifactService {
             .map_err(|e| PcwError::RedisError(e.to_string()))?;
 
         if let Some(sid) = session_id {
+            // Issue a baton binding this chain to its originating session
+            crate::baton::init(&artifact.artifact_id, sid, conn).await?;
+
             let _: () = conn
                 .sadd(key_session_artifacts(sid), &artifact.artifact_id)
                 .await
@@ -60,13 +63,30 @@ impl ArtifactService {
         artifact_id: &str,
         conn: &mut redis::aio::MultiplexedConnection,
     ) -> PcwResult<Artifact> {
-        let key = key_artifact(artifact_id);
-        let raw: Option<String> = conn
-            .get(&key)
-            .await
-            .map_err(|e| PcwError::RedisError(e.to_string()))?;
-        let json = raw.ok_or_else(|| PcwError::ArtifactNotFound(artifact_id.to_string()))?;
-        serde_json::from_str(&json).map_err(|e| PcwError::SerializationError(e.to_string()))
+        // Resolve to root ID: if this artifact has a parent, its root is the parent
+        // (all chains are one level deep — parent_version_id always points to root).
+        // Check the dropped set using the root to cover every version in the chain.
+        let root_id_check = {
+            let key = key_artifact(artifact_id);
+            let raw: Option<String> = conn
+                .get(&key)
+                .await
+                .map_err(|e| PcwError::RedisError(e.to_string()))?;
+            let json = raw.ok_or_else(|| PcwError::ArtifactNotFound(artifact_id.to_string()))?;
+            let a: Artifact = serde_json::from_str(&json)
+                .map_err(|e| PcwError::SerializationError(e.to_string()))?;
+            let root = a.parent_version_id.clone().unwrap_or_else(|| artifact_id.to_string());
+            (a, root)
+        };
+        let (artifact, root_id) = root_id_check;
+
+        if crate::baton::is_dropped(&root_id, conn).await? {
+            return Err(PcwError::BatonDropped(format!(
+                "artifact chain {root_id} is sealed"
+            )));
+        }
+
+        Ok(artifact)
     }
 
     pub async fn list_for_session(
