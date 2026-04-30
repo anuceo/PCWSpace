@@ -9,6 +9,7 @@ members = [
     "crates/runtime",
     "crates/intelligence",
     "crates/storm",
+    "crates/setup-tui",
     "crates/audit",
     "crates/timeline",
     "crates/api",
