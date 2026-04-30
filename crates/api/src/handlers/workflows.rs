@@ -1,5 +1,5 @@
 use axum::{extract::Path, Json};
-use infra::redis_client::get_multiplexed_connection;
+use infra::{metrics, redis_client::get_multiplexed_connection};
 use workflows::{definitions::get_definition, engine::WorkflowEngine, worker::enqueue};
 use serde::Deserialize;
 use serde_json::json;
@@ -28,6 +28,7 @@ pub async fn start_workflow(Json(body): Json<StartWorkflowBody>) -> ApiResult {
 
     // Enqueue first step for async processing
     enqueue(&state.workflow_id, &mut conn).await.map_err(map_err)?;
+    metrics::global().increment(metrics::names::WORKFLOWS_STARTED);
 
     ok(state)
 }

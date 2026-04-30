@@ -3,11 +3,11 @@ use pcw_core::{
     models::{AgentResult, AgentType, Message, Session, SessionStatus, now},
 };
 use deltashots::engine::{append_deltashot, AppendParams};
-use infra::redis_client::key_session_meta;
+use infra::{metrics, redis_client::key_session_meta};
 use agents::router::AgentRouter;
 use intelligence::analyzer::analyze_task;
 use redis::AsyncCommands;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use std::collections::HashMap;
 
 pub struct Orchestrator {
@@ -52,7 +52,7 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Full agent call lifecycle: load → analyze → call → diff → deltashot → save.
+    /// Full agent call lifecycle: load → analyze → route by quality → call → diff → deltashot → save.
     #[instrument(skip(self, conn), fields(session_id, agent_override = ?agent_override))]
     pub async fn call_agent(
         &self,
@@ -73,16 +73,37 @@ impl Orchestrator {
 
         let before = session.to_state_object();
 
-        // 2. Analyze & select agent
+        // 2. Analyze & select agent — quality threshold may override category routing
         let analysis = analyze_task(user_message);
-        let agent_type = agent_override.unwrap_or(analysis.suggested_agent.clone());
+        let agent_type = agent_override.unwrap_or_else(|| {
+            let effective = analysis.effective_agent();
+            if effective != analysis.suggested_agent {
+                warn!(
+                    quality = analysis.quality.overall,
+                    suggested = %analysis.suggested_agent,
+                    "Low quality score — falling back to Claude"
+                );
+            }
+            effective
+        });
 
         // 3. Add user message
         session.messages.push(Message::user(user_message));
 
         // 4. Call agent
-        debug!(agent = %agent_type, "Calling agent");
-        let mut result = self.router.call(agent_type.clone(), &session.messages, system_prompt).await?;
+        debug!(agent = %agent_type, quality = analysis.quality.overall, "Calling agent");
+        let call_result = self.router.call(agent_type.clone(), &session.messages, system_prompt).await;
+
+        let mut result = match call_result {
+            Ok(r) => {
+                metrics::global().increment(metrics::names::AGENT_CALLS);
+                r
+            }
+            Err(e) => {
+                metrics::global().increment(metrics::names::AGENT_ERRORS);
+                return Err(e);
+            }
+        };
 
         // 5. Add assistant message to session
         session.messages.push(Message::assistant(result.response.clone(), agent_type.clone()));
@@ -105,6 +126,7 @@ impl Orchestrator {
         )
         .await?;
 
+        metrics::global().increment(metrics::names::DELTASHOTS_APPENDED);
         result.shot_id = Some(shot.deltashot_id);
 
         // 7. Persist updated session
@@ -121,6 +143,7 @@ impl Orchestrator {
     ) -> PcwResult<Session> {
         let session = Session::new(workspace_id);
         Self::save_session(&session, conn).await?;
+        metrics::global().increment(metrics::names::SESSIONS_CREATED);
         info!(session_id = %session.session_id, "Session created");
         Ok(session)
     }
@@ -147,6 +170,8 @@ impl Orchestrator {
             .expire(&key, closed_ttl as i64)
             .await
             .map_err(|e| PcwError::RedisError(e.to_string()))?;
+
+        metrics::global().increment(metrics::names::SESSIONS_CLOSED);
 
         // Fire-and-forget final Notion sync — does not block the API response
         let snapshot = session.clone();

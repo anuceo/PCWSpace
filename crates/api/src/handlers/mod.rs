@@ -2,6 +2,7 @@ pub mod artifacts;
 pub mod deltashots;
 pub mod sessions;
 pub mod workflows;
+pub mod metrics;
 
 use axum::{http::StatusCode, Json};
 use serde_json::{json, Value};

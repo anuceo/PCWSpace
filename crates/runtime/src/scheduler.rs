@@ -19,7 +19,10 @@ pub async fn run_workflow_worker_loop(
     loop {
         let mut conn = get_multiplexed_connection().await?;
         match process_next(&mut conn).await {
-            Ok(true)  => debug!("Processed a workflow job"),
+            Ok(true)  => {
+                infra::metrics::global().increment(infra::metrics::names::WORKFLOWS_COMPLETED);
+                debug!("Processed a workflow job");
+            }
             Ok(false) => {}
             Err(e)    => tracing::warn!(error = %e, "Workflow worker error"),
         }

@@ -2,6 +2,7 @@ use pcw_core::errors::{PcwError, PcwResult};
 use pcw_core::models::{Artifact, Session};
 use reqwest::Client;
 use serde_json::{json, Value};
+use crate::metrics;
 
 // ── NotionClient ───────────────────────────────────────────────────────────
 
@@ -167,10 +168,14 @@ pub async fn sync_session(session: &Session) -> Option<String> {
     // Notion allows at most 100 children per request.
     children.truncate(100);
 
-    client
+    let result = client
         .create_page(&settings.notion_database_id, properties, children)
         .await
-        .ok()
+        .ok();
+    if result.is_some() {
+        metrics::global().increment(metrics::names::NOTION_SYNCS);
+    }
+    result
 }
 
 /// Sync an Artifact to Notion. Returns the created page_id, or `None` if
@@ -202,8 +207,12 @@ pub async fn sync_artifact(artifact: &Artifact) -> Option<String> {
         ),
     ];
 
-    client
+    let result = client
         .create_page(&settings.notion_artifacts_database_id, properties, children)
         .await
-        .ok()
+        .ok();
+    if result.is_some() {
+        metrics::global().increment(metrics::names::NOTION_SYNCS);
+    }
+    result
 }

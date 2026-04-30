@@ -2,7 +2,7 @@ use pcw_core::{
     errors::{PcwError, PcwResult},
     models::{Artifact, ArtifactType, AgentType, new_id, now},
 };
-use infra::redis_client::{key_artifact, key_artifact_versions, key_artifact_latest, key_session_artifacts};
+use infra::{metrics, redis_client::{key_artifact, key_artifact_versions, key_artifact_latest, key_session_artifacts}};
 use redis::AsyncCommands;
 use sha2::{Digest, Sha256};
 use tracing::{debug, instrument};
@@ -55,6 +55,7 @@ impl ArtifactService {
                 .map_err(|e| PcwError::RedisError(e.to_string()))?;
         }
 
+        metrics::global().increment(metrics::names::ARTIFACTS_CREATED);
         debug!(artifact_id = %artifact.artifact_id, "Artifact created");
         Ok(artifact)
     }

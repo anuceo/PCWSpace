@@ -1,5 +1,5 @@
 use axum::{extract::Path, Json};
-use infra::redis_client::get_multiplexed_connection;
+use infra::{metrics, redis_client::get_multiplexed_connection};
 use deltashots::{replay::{replay_session, list_rollback_points}, store::count_shots};
 use serde::Deserialize;
 use super::{ok, map_err, ApiResult};
@@ -21,6 +21,7 @@ pub async fn replay(
     Path(session_id): Path<String>,
     Json(body): Json<ReplayQuery>,
 ) -> ApiResult {
+    metrics::global().increment(metrics::names::REPLAY_CALLS);
     let mut conn = get_multiplexed_connection().await.map_err(map_err)?;
     let state = replay_session(&session_id, body.up_to_sequence, &mut conn)
         .await

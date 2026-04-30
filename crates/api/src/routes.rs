@@ -4,7 +4,7 @@ use axum::{
     Router,
 };
 use crate::{
-    handlers::{artifacts, deltashots, sessions, workflows},
+    handlers::{artifacts, deltashots, metrics, sessions, workflows},
     middleware::require_api_key,
 };
 
@@ -32,6 +32,8 @@ pub fn build_router() -> Router {
         .route("/sessions/:id/replay", post(deltashots::replay))
         .route("/sessions/:id/rollback-points", get(deltashots::rollback_points))
         .route("/sessions/:id/fork", post(deltashots::fork_session))
+        // Metrics
+        .route("/metrics", get(metrics::get_metrics))
         .layer(middleware::from_fn(require_api_key));
 
     Router::new()
