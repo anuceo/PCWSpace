@@ -3,6 +3,7 @@ use pcw_core::models::ArtifactType;
 use infra::redis_client::get_multiplexed_connection;
 use artifacts::{service::ArtifactService, versions};
 use serde::Deserialize;
+use tracing::info;
 use super::{ok, map_err, ApiResult};
 
 #[derive(Deserialize)]
@@ -42,6 +43,15 @@ pub async fn create_artifact(Json(body): Json<CreateArtifactBody>) -> ApiResult 
     )
     .await
     .map_err(map_err)?;
+
+    // Fire-and-forget Notion sync — does not block the response
+    let snapshot = artifact.clone();
+    tokio::spawn(async move {
+        if let Some(page_id) = infra::notion::sync_artifact(&snapshot).await {
+            info!(artifact_id = %snapshot.artifact_id, notion_page = %page_id, "Artifact synced to Notion");
+        }
+    });
+
     ok(artifact)
 }
 

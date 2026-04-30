@@ -28,6 +28,10 @@ pub struct Settings {
 
     // Security
     pub session_key_ttl_secs: u64,
+    /// TTL applied to a session's Redis key after it is closed.
+    /// Active sessions use a sliding TTL (reset on every write); closed sessions
+    /// no longer receive writes, so we apply this fixed window instead.
+    pub closed_session_ttl_secs: u64,
 }
 
 impl Settings {
@@ -72,6 +76,7 @@ impl Settings {
             pcw_port:                     env_u16("PCW_PORT", 8000),
             pcw_log_level:                env_or("PCW_LOG_LEVEL", "info"),
             session_key_ttl_secs:         env_u64("SESSION_KEY_TTL_SECS", 86400),
+            closed_session_ttl_secs:      env_u64("CLOSED_SESSION_TTL_SECS", 30 * 24 * 3600),
         })
     }
 }

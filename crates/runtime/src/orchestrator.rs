@@ -33,7 +33,10 @@ impl Orchestrator {
         serde_json::from_str(&json).map_err(|e| PcwError::SerializationError(e.to_string()))
     }
 
-    /// Persist session state to Redis.
+    /// Persist session state to Redis with a sliding TTL.
+    /// Every write resets the window to `SESSION_KEY_TTL_SECS` so active
+    /// sessions never expire mid-conversation. Closed sessions get a longer
+    /// fixed TTL applied by `close_session` immediately after this call.
     pub async fn save_session(
         session: &Session,
         conn: &mut redis::aio::MultiplexedConnection,
@@ -41,8 +44,9 @@ impl Orchestrator {
         let key = key_session_meta(&session.session_id);
         let json = serde_json::to_string(session)
             .map_err(|e| PcwError::SerializationError(e.to_string()))?;
+        let ttl = pcw_core::config::get_settings().session_key_ttl_secs;
         let _: () = conn
-            .set(&key, json)
+            .set_ex(&key, json, ttl)
             .await
             .map_err(|e| PcwError::RedisError(e.to_string()))?;
         Ok(())
@@ -122,6 +126,11 @@ impl Orchestrator {
     }
 
     /// Close a session.
+    ///
+    /// Applies a long fixed TTL (`CLOSED_SESSION_TTL_SECS`, default 30 days)
+    /// to the Redis key — closed sessions receive no further writes, so the
+    /// sliding window from `save_session` would not keep them alive. Then
+    /// fires a background Notion sync of the final session state.
     pub async fn close_session(
         session_id: &str,
         conn: &mut redis::aio::MultiplexedConnection,
@@ -129,7 +138,25 @@ impl Orchestrator {
         let mut session = Self::load_session(session_id, conn).await?;
         session.status = SessionStatus::Closed;
         session.closed_at = Some(now());
-        Self::save_session(&session, conn).await
+        Self::save_session(&session, conn).await?;
+
+        // Override with longer TTL — closed sessions no longer slide
+        let closed_ttl = pcw_core::config::get_settings().closed_session_ttl_secs;
+        let key = key_session_meta(session_id);
+        let _: () = conn
+            .expire(&key, closed_ttl as i64)
+            .await
+            .map_err(|e| PcwError::RedisError(e.to_string()))?;
+
+        // Fire-and-forget final Notion sync — does not block the API response
+        let snapshot = session.clone();
+        tokio::spawn(async move {
+            if let Some(page_id) = infra::notion::sync_session(&snapshot).await {
+                info!(session_id = %snapshot.session_id, notion_page = %page_id, "Session synced to Notion");
+            }
+        });
+
+        Ok(())
     }
 }
 
