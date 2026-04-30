@@ -2,7 +2,7 @@ use pcw_core::{
     errors::{PcwError, PcwResult},
     models::{Artifact, ArtifactType, AgentType, new_id, now},
 };
-use infra::redis_client::{key_artifact, key_artifact_versions, key_session_artifacts};
+use infra::redis_client::{key_artifact, key_artifact_versions, key_artifact_latest, key_session_artifacts};
 use redis::AsyncCommands;
 use sha2::{Digest, Sha256};
 use tracing::{debug, instrument};
@@ -39,6 +39,12 @@ impl ArtifactService {
 
         Self::persist(&artifact, conn).await?;
 
+        // Initialise the latest pointer — on a fresh artifact v1 is the latest
+        let _: () = conn
+            .set(key_artifact_latest(&artifact.artifact_id), &artifact.artifact_id)
+            .await
+            .map_err(|e| PcwError::RedisError(e.to_string()))?;
+
         if let Some(sid) = session_id {
             let _: () = conn
                 .sadd(key_session_artifacts(sid), &artifact.artifact_id)
@@ -67,14 +73,21 @@ impl ArtifactService {
         session_id: &str,
         conn: &mut redis::aio::MultiplexedConnection,
     ) -> PcwResult<Vec<Artifact>> {
-        let ids: Vec<String> = conn
+        // The set contains only root IDs — one entry per logical artifact
+        let root_ids: Vec<String> = conn
             .smembers(key_session_artifacts(session_id))
             .await
             .map_err(|e| PcwError::RedisError(e.to_string()))?;
 
         let mut artifacts = Vec::new();
-        for id in ids {
-            if let Ok(a) = Self::get(&id, conn).await {
+        for root_id in root_ids {
+            // Resolve to the current version via the latest pointer
+            let latest_id: Option<String> = conn
+                .get(key_artifact_latest(&root_id))
+                .await
+                .unwrap_or(None);
+            let resolve_id = latest_id.as_deref().unwrap_or(root_id.as_str());
+            if let Ok(a) = Self::get(resolve_id, conn).await {
                 artifacts.push(a);
             }
         }

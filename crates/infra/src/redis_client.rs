@@ -54,6 +54,9 @@ pub fn key_artifact(artifact_id: &str) -> String {
 pub fn key_artifact_versions(base_id: &str) -> String {
     format!("pcw:artifact:{base_id}:versions")
 }
+pub fn key_artifact_latest(root_id: &str) -> String {
+    format!("pcw:artifact:{root_id}:latest")
+}
 pub fn key_workflow_state(workflow_id: &str) -> String {
     format!("pcw:workflow:{workflow_id}:state")
 }

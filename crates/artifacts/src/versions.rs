@@ -2,7 +2,7 @@ use pcw_core::{
     errors::{PcwError, PcwResult},
     models::{Artifact, AgentType, new_id, now},
 };
-use infra::redis_client::{key_artifact, key_artifact_versions};
+use infra::redis_client::{key_artifact, key_artifact_versions, key_artifact_latest};
 use redis::AsyncCommands;
 use sha2::{Digest, Sha256};
 use tracing::instrument;
@@ -52,21 +52,19 @@ pub async fn new_version(
         .await
         .map_err(|e| PcwError::RedisError(e.to_string()))?;
 
-    // Append to version list of the original artifact chain
+    // Append to version list of the root artifact chain
     let ver_key = key_artifact_versions(parent_id);
     let _: () = conn
         .rpush(&ver_key, &new_artifact.artifact_id)
         .await
         .map_err(|e| PcwError::RedisError(e.to_string()))?;
 
-    // Keep the session artifact set up to date (v1 was added on create; add new versions too)
-    if let Some(ref session_id) = new_artifact.linked_session {
-        let ses_key = infra::redis_client::key_session_artifacts(session_id);
-        let _: () = conn
-            .sadd(&ses_key, &new_artifact.artifact_id)
-            .await
-            .map_err(|e| PcwError::RedisError(e.to_string()))?;
-    }
+    // Advance the latest pointer so list_for_session always resolves to current content.
+    // parent_id is treated as the root — callers must pass the root artifact ID.
+    let _: () = conn
+        .set(key_artifact_latest(parent_id), &new_artifact.artifact_id)
+        .await
+        .map_err(|e| PcwError::RedisError(e.to_string()))?;
 
     Ok(new_artifact)
 }
