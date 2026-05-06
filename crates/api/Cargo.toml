@@ -21,7 +21,6 @@ workflows    = { path = "../workflows" }
 runtime      = { path = "../runtime" }
 intelligence = { path = "../intelligence" }
 storm        = { path = "../storm" }
-audit        = { path = "../audit" }
 timeline     = { path = "../timeline" }
 axum         = { workspace = true }
 tower        = { workspace = true }

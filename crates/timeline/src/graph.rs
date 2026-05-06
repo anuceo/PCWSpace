@@ -1,6 +1,5 @@
 use pcw_core::errors::PcwResult;
 use deltashots::store::{count_shots, get_all_shots};
-use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
