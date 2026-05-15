@@ -12,6 +12,28 @@ This API is a command interface over a temporal execution engine. It is determin
 4. State is versioned and never blindly overwritten.
 5. Artifacts are versioned, not replaced.
 
+## Authentication and authorization
+
+When auth middleware is enabled, clients must provide API credentials using one of:
+
+- `Authorization: Bearer <api_key>`
+- `x-api-key: <api_key>`
+
+Role permissions:
+
+- **reader**: read-only API routes (`GET`/`HEAD`)
+- **writer**: reader + mutation routes (`POST`)
+- **admin**: writer + `/debug/*` endpoints
+
+Auth middleware operational environment:
+
+- `DELTA_AGENT_AUTH_REQUIRED` (default `false`)
+- `DELTA_AGENT_AUTH_DISABLED` (default `false`)
+- `DELTA_AGENT_API_KEY` / `DELTA_AGENT_API_KEYS` (writer keys)
+- `DELTA_AGENT_READONLY_API_KEY` / `DELTA_AGENT_READONLY_API_KEYS` (reader keys)
+- `DELTA_AGENT_ADMIN_API_KEY` / `DELTA_AGENT_ADMIN_API_KEYS` (admin keys)
+- `PCW_API_KEY` (compatibility writer key)
+
 ## Global response contract
 
 ### Success envelope

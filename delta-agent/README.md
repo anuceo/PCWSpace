@@ -111,6 +111,28 @@ Formal spec artifacts:
 - `GET /api/v1/sessions/{sessionId}/trace`
 - `GET /api/v1/health`
 
+### Authentication / authorization middleware
+
+`/api/v1/*` is protected by API-key middleware when auth is enabled. Credentials can be sent via:
+
+- `Authorization: Bearer <api_key>`
+- `x-api-key: <api_key>`
+
+Role mapping:
+
+- **reader**: GET/HEAD API routes
+- **writer**: reader permissions + mutation routes (POST)
+- **admin**: writer permissions + `/api/v1/debug/*`
+
+Configuration environment variables:
+
+- `DELTA_AGENT_AUTH_REQUIRED` (default `false`)
+- `DELTA_AGENT_AUTH_DISABLED` (default `false`)
+- `DELTA_AGENT_API_KEY` / `DELTA_AGENT_API_KEYS` (writer keys)
+- `DELTA_AGENT_READONLY_API_KEY` / `DELTA_AGENT_READONLY_API_KEYS` (reader keys)
+- `DELTA_AGENT_ADMIN_API_KEY` / `DELTA_AGENT_ADMIN_API_KEYS` (admin keys)
+- `PCW_API_KEY` is also accepted as a writer key for compatibility
+
 ### Response metadata
 
 All successful responses include:
