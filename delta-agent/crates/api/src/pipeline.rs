@@ -2412,83 +2412,69 @@ impl ExecutionPipeline {
         );
         self.append_agent_log(session_id, &agent, &reason).await;
 
-        let agent_output = if self.agent_runtime_config.use_real_agents {
-            let provider = map_agent_kind(agent);
-            let router =
-                RealAgentRouter::new(self.agent_runtime_config.clone()).map_err(map_agent_error)?;
-            let mut stream = router
-                .stream(
-                    provider,
-                    AgentRequest {
-                        session_id: session_id.to_owned(),
-                        request_id: format!("req_{}", uuid::Uuid::new_v4().simple()),
-                        prompt: request.content.clone(),
-                        context: context
-                            .memory
-                            .iter()
-                            .rev()
-                            .map(|message| ClientAgentMessage {
-                                role: message.role.clone(),
-                                content: message.content.clone(),
-                            })
-                            .collect::<Vec<_>>(),
-                        metadata: request.metadata.clone(),
-                        mode: map_message_mode(&request.mode),
-                        model_override: None,
-                        max_tokens: None,
-                        temperature: None,
-                    },
-                )
-                .await
-                .map_err(map_agent_error)?;
+        if !self.agent_runtime_config.use_real_agents {
+            return Err(PipelineError::InvalidInput(
+                "DELTA_AGENT_USE_REAL_AGENTS must be true for streaming".to_owned(),
+            ));
+        }
 
-            let mut accumulated = String::new();
-            let mut saw_done = false;
-            while let Some(event) = stream.next().await {
-                match event.map_err(map_agent_error)? {
-                    crate::agents::types::AgentStreamEvent::Token { delta } => {
-                        accumulated.push_str(&delta);
-                        events.push(stream_event(
-                            "token",
-                            StreamTokenEvent {
-                                delta,
-                                accumulated: accumulated.clone(),
-                            },
-                        ));
-                    }
-                    crate::agents::types::AgentStreamEvent::Usage { .. } => {}
-                    crate::agents::types::AgentStreamEvent::Done { .. } => {
-                        saw_done = true;
-                        break;
-                    }
+        let provider = map_agent_kind(agent);
+        let router =
+            RealAgentRouter::new(self.agent_runtime_config.clone()).map_err(map_agent_error)?;
+        let mut stream = router
+            .stream(
+                provider,
+                AgentRequest {
+                    session_id: session_id.to_owned(),
+                    request_id: format!("req_{}", uuid::Uuid::new_v4().simple()),
+                    prompt: request.content.clone(),
+                    context: context
+                        .memory
+                        .iter()
+                        .rev()
+                        .map(|message| ClientAgentMessage {
+                            role: message.role.clone(),
+                            content: message.content.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                    metadata: request.metadata.clone(),
+                    mode: map_message_mode(&request.mode),
+                    model_override: None,
+                    max_tokens: None,
+                    temperature: None,
+                },
+            )
+            .await
+            .map_err(map_agent_error)?;
+
+        let mut accumulated = String::new();
+        let mut saw_done = false;
+        while let Some(event) = stream.next().await {
+            match event.map_err(map_agent_error)? {
+                crate::agents::types::AgentStreamEvent::Token { delta } => {
+                    accumulated.push_str(&delta);
+                    events.push(stream_event(
+                        "token",
+                        StreamTokenEvent {
+                            delta,
+                            accumulated: accumulated.clone(),
+                        },
+                    ));
+                }
+                crate::agents::types::AgentStreamEvent::Usage { .. } => {}
+                crate::agents::types::AgentStreamEvent::Done { .. } => {
+                    saw_done = true;
+                    break;
                 }
             }
-            if !saw_done {
-                return Err(PipelineError::Internal(
-                    "agent stream completed without done event".to_owned(),
-                ));
-            }
-            let mut output = run_agent(agent, &request.content, &context, &request.mode);
-            output.text = accumulated;
-            output
-        } else {
-            let agent_output = run_agent(agent, &request.content, &context, &request.mode);
-            let mut accumulated = String::new();
-            for token in tokenize_stream_chunks(&agent_output.text) {
-                if !accumulated.is_empty() {
-                    accumulated.push(' ');
-                }
-                accumulated.push_str(&token);
-                events.push(stream_event(
-                    "token",
-                    StreamTokenEvent {
-                        delta: token,
-                        accumulated: accumulated.clone(),
-                    },
-                ));
-            }
-            agent_output
-        };
+        }
+        if !saw_done {
+            return Err(PipelineError::Internal(
+                "agent stream completed without done event".to_owned(),
+            ));
+        }
+        let agent_output =
+            build_agent_output_from_text(&request.content, &context, &request.mode, accumulated);
 
         let prev_state = context.state.clone();
         let next_state = apply_state_mutation(&prev_state, &request.content, &agent_output);
@@ -2590,7 +2576,21 @@ impl ExecutionPipeline {
         agent: AgentKind,
     ) -> Result<AgentOutput, PipelineError> {
         if !self.agent_runtime_config.use_real_agents {
-            return Ok(run_agent(agent, &request.content, context, &request.mode));
+            #[cfg(test)]
+            {
+                return Ok(build_agent_output_from_text(
+                    &request.content,
+                    context,
+                    &request.mode,
+                    format!("[test-agent] {}", request.content),
+                ));
+            }
+            #[cfg(not(test))]
+            {
+                return Err(PipelineError::InvalidInput(
+                    "DELTA_AGENT_USE_REAL_AGENTS must be true for message execution".to_owned(),
+                ));
+            }
         }
 
         let agent_request = AgentRequest {
@@ -2627,9 +2627,12 @@ impl ExecutionPipeline {
             "real agent completion executed"
         );
 
-        let mut output = run_agent(agent, &request.content, context, &request.mode);
-        output.text = result.text;
-        Ok(output)
+        Ok(build_agent_output_from_text(
+            &request.content,
+            context,
+            &request.mode,
+            result.text,
+        ))
     }
 
     async fn hydrate_context(&self, session_id: &str) -> SessionContext {
@@ -3175,24 +3178,12 @@ fn select_agent(
     }
 }
 
-fn run_agent(
-    agent: AgentKind,
+fn build_agent_output_from_text(
     input: &str,
     context: &SessionContext,
     mode: &MessageMode,
+    response_text: String,
 ) -> AgentOutput {
-    let complexity = estimate_complexity(input);
-    let memory_hint = context.memory.len();
-    let prefix = match agent {
-        AgentKind::Claude => "reasoning",
-        AgentKind::DeepSeek => "technical",
-    };
-
-    let response_text = format!(
-        "[{prefix}:{complexity}:{:?}] processed '{}' with {} memory items",
-        mode, input, memory_hint
-    );
-
     let lower = input.to_ascii_lowercase();
     let proposed_goal = if lower.contains("finalize") {
         Some("finalize landing page".to_owned())
@@ -3226,14 +3217,6 @@ fn run_agent(
         proposed_step,
         artifact_type,
         artifact_content,
-    }
-}
-
-fn estimate_complexity(input: &str) -> &'static str {
-    match input.split_whitespace().count() {
-        0..=12 => "low",
-        13..=35 => "medium",
-        _ => "high",
     }
 }
 
@@ -3401,13 +3384,6 @@ fn load_branch_into_session(
     session.deltashot_ids = branch.deltashot_ids;
     session.artifacts = branch.artifacts;
     Ok(())
-}
-
-fn tokenize_stream_chunks(content: &str) -> Vec<String> {
-    content
-        .split_whitespace()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>()
 }
 
 fn stream_event<T: Serialize>(event: &str, data: T) -> StreamEventEnvelope {
