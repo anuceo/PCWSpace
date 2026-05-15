@@ -3086,7 +3086,7 @@ impl ExecutionPipeline {
         let owner = format!("lock_{}", uuid::Uuid::new_v4().simple());
 
         for _ in 0..SESSION_LOCK_RETRIES {
-            if let Some(backend) = self.try_acquire_lock(&lock_key, &owner).await {
+            if let Some(backend) = self.try_acquire_lock(&lock_key, &owner).await? {
                 return Ok(SessionLockHandle {
                     key: lock_key.clone(),
                     owner: owner.clone(),
@@ -3098,22 +3098,31 @@ impl ExecutionPipeline {
         Err(PipelineError::LockUnavailable)
     }
 
-    async fn try_acquire_lock(&self, lock_key: &str, owner: &str) -> Option<SessionLockBackend> {
-        if let Some(repo) = self.persistence_backend().await {
-            match repo
+    async fn try_acquire_lock(
+        &self,
+        lock_key: &str,
+        owner: &str,
+    ) -> Result<Option<SessionLockBackend>, PipelineError> {
+        if self.persistence.is_some() {
+            let repo = self.persistence_backend().await.ok_or_else(|| {
+                PipelineError::Internal(
+                    "distributed lock backend unavailable while persistence is enabled".to_owned(),
+                )
+            })?;
+            let acquired = repo
                 .try_acquire_distributed_lock(lock_key, owner, SESSION_LOCK_TTL_SECS)
                 .await
-            {
-                Ok(true) => return Some(SessionLockBackend::Distributed),
-                Ok(false) => return None,
-                Err(err) => {
-                    warn!(
-                        lock_key = %lock_key,
-                        error = %err,
-                        "distributed lock acquisition failed, falling back to in-memory lock"
-                    );
-                }
-            }
+                .map_err(|err| {
+                    PipelineError::Internal(format!(
+                        "distributed lock acquisition failed for '{}': {err}",
+                        lock_key
+                    ))
+                })?;
+            return Ok(if acquired {
+                Some(SessionLockBackend::Distributed)
+            } else {
+                None
+            });
         }
 
         let mut locks = self.locks.lock().await;
@@ -3121,7 +3130,7 @@ impl ExecutionPipeline {
         locks.retain(|_, (_, expires_at)| *expires_at > now);
 
         if locks.contains_key(lock_key) {
-            return None;
+            return Ok(None);
         }
 
         locks.insert(
@@ -3131,23 +3140,28 @@ impl ExecutionPipeline {
                 now + Duration::from_secs(SESSION_LOCK_TTL_SECS),
             ),
         );
-        Some(SessionLockBackend::InMemory)
+        Ok(Some(SessionLockBackend::InMemory))
     }
 
     async fn release_lock(&self, handle: &SessionLockHandle) {
         match handle.backend {
             SessionLockBackend::Distributed => {
-                if let Some(repo) = self.persistence_backend().await {
-                    if let Err(err) = repo
-                        .release_distributed_lock(&handle.key, &handle.owner)
-                        .await
-                    {
-                        warn!(
-                            lock_key = %handle.key,
-                            error = %err,
-                            "failed to release distributed lock"
-                        );
-                    }
+                let Some(repo) = self.persistence_backend().await else {
+                    warn!(
+                        lock_key = %handle.key,
+                        "distributed lock backend unavailable during release"
+                    );
+                    return;
+                };
+                if let Err(err) = repo
+                    .release_distributed_lock(&handle.key, &handle.owner)
+                    .await
+                {
+                    warn!(
+                        lock_key = %handle.key,
+                        error = %err,
+                        "failed to release distributed lock"
+                    );
                 }
             }
             SessionLockBackend::InMemory => {
@@ -3175,39 +3189,51 @@ impl ExecutionPipeline {
     }
 
     async fn load_cached_stream_events(&self, cache_key: &str) -> Option<Vec<StreamEventEnvelope>> {
-        {
-            let cache = self.idempotent_streams.lock().await;
-            if let Some(cached) = cache.get(cache_key) {
-                return Some(cached.clone());
-            }
+        if self.persistence.is_some() {
+            let repo = match self.persistence_backend().await {
+                Some(repo) => repo,
+                None => {
+                    warn!(
+                        cache_key = %cache_key,
+                        "idempotency backend unavailable while persistence is enabled"
+                    );
+                    return None;
+                }
+            };
+            let payload = match repo.load_idempotency_payload(cache_key).await {
+                Ok(value) => value?,
+                Err(err) => {
+                    warn!(cache_key = %cache_key, error = %err, "failed to load idempotent stream cache");
+                    return None;
+                }
+            };
+            let cached = match serde_json::from_str::<Vec<StreamEventEnvelope>>(&payload) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    warn!(cache_key = %cache_key, error = %err, "invalid idempotent stream payload");
+                    return None;
+                }
+            };
+            let mut cache = self.idempotent_streams.lock().await;
+            cache.insert(cache_key.to_owned(), cached.clone());
+            return Some(cached);
         }
 
-        let repo = self.persistence_backend().await?;
-        let payload = match repo.load_idempotency_payload(cache_key).await {
-            Ok(value) => value?,
-            Err(err) => {
-                warn!(cache_key = %cache_key, error = %err, "failed to load idempotent stream cache");
-                return None;
-            }
-        };
-        let cached = match serde_json::from_str::<Vec<StreamEventEnvelope>>(&payload) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                warn!(cache_key = %cache_key, error = %err, "invalid idempotent stream payload");
-                return None;
-            }
-        };
-        let mut cache = self.idempotent_streams.lock().await;
-        cache.insert(cache_key.to_owned(), cached.clone());
-        Some(cached)
+        let cache = self.idempotent_streams.lock().await;
+        cache.get(cache_key).cloned()
     }
 
     async fn store_cached_stream_events(&self, cache_key: &str, events: &[StreamEventEnvelope]) {
-        {
+        if self.persistence.is_none() {
             let mut cache = self.idempotent_streams.lock().await;
             cache.insert(cache_key.to_owned(), events.to_vec());
+            return;
         }
         let Some(repo) = self.persistence_backend().await else {
+            warn!(
+                cache_key = %cache_key,
+                "idempotency backend unavailable while persistence is enabled"
+            );
             return;
         };
         let payload = match serde_json::to_string(events) {
@@ -3222,7 +3248,10 @@ impl ExecutionPipeline {
             .await
         {
             warn!(cache_key = %cache_key, error = %err, "failed to persist idempotent stream cache");
+            return;
         }
+        let mut cache = self.idempotent_streams.lock().await;
+        cache.insert(cache_key.to_owned(), events.to_vec());
     }
 
     async fn append_message(
