@@ -1825,6 +1825,7 @@ impl ExecutionPipeline {
             if !branch_ids.iter().any(|branch| branch == MAIN_BRANCH_ID) {
                 branch_ids.push(MAIN_BRANCH_ID.to_owned());
             }
+            let branch_id_set = branch_ids.iter().cloned().collect::<HashSet<_>>();
             let active_branch_id = repo
                 .get_session_active_branch(&session_id)
                 .await
@@ -1850,50 +1851,75 @@ impl ExecutionPipeline {
                 session.status = meta.status;
                 session.workflow_id = meta.workflow_id;
             }
-            let persisted_messages = match repo.load_session_messages(&session_id).await {
-                Ok(messages) => messages
-                    .into_iter()
-                    .map(|message| {
+            let mut branch_messages = HashMap::<String, Vec<ChatMessage>>::new();
+            match repo.load_session_messages(&session_id).await {
+                Ok(messages) => {
+                    for message in messages {
                         update_max_id_seed(&mut max_id, &message.id);
-                        ChatMessage {
-                            id: message.id,
-                            role: message.role,
-                            content: message.content,
-                            timestamp: message.timestamp,
-                        }
-                    })
-                    .collect::<Vec<_>>(),
+                        let branch_id = if message.branch_id.is_empty()
+                            || !branch_id_set.contains(&message.branch_id)
+                        {
+                            MAIN_BRANCH_ID.to_owned()
+                        } else {
+                            message.branch_id
+                        };
+                        branch_messages
+                            .entry(branch_id)
+                            .or_default()
+                            .push(ChatMessage {
+                                id: message.id,
+                                role: message.role,
+                                content: message.content,
+                                timestamp: message.timestamp,
+                            });
+                    }
+                }
                 Err(err) => {
                     warn!(
                         session_id = %session_id,
                         error = %err,
                         "failed to hydrate session messages"
                     );
-                    Vec::new()
                 }
-            };
-            let persisted_events = match repo.load_session_events(&session_id).await {
-                Ok(events) => events
-                    .into_iter()
-                    .map(|event| {
+            }
+            for branch in branch_messages.values_mut() {
+                branch.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+            }
+
+            let mut branch_events = HashMap::<String, Vec<SessionEvent>>::new();
+            match repo.load_session_events(&session_id).await {
+                Ok(events) => {
+                    for event in events {
                         update_max_id_seed(&mut max_id, &event.id);
-                        SessionEvent {
-                            id: event.id,
-                            event_type: event.event_type,
-                            payload: event.payload,
-                            timestamp: event.timestamp,
-                        }
-                    })
-                    .collect::<Vec<_>>(),
+                        let branch_id = if event.branch_id.is_empty()
+                            || !branch_id_set.contains(&event.branch_id)
+                        {
+                            MAIN_BRANCH_ID.to_owned()
+                        } else {
+                            event.branch_id
+                        };
+                        branch_events
+                            .entry(branch_id)
+                            .or_default()
+                            .push(SessionEvent {
+                                id: event.id,
+                                event_type: event.event_type,
+                                payload: event.payload,
+                                timestamp: event.timestamp,
+                            });
+                    }
+                }
                 Err(err) => {
                     warn!(
                         session_id = %session_id,
                         error = %err,
                         "failed to hydrate session events"
                     );
-                    Vec::new()
                 }
-            };
+            }
+            for branch in branch_events.values_mut() {
+                branch.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+            }
 
             for branch_id in branch_ids {
                 update_max_id_seed(&mut max_id, &branch_id);
@@ -1953,8 +1979,8 @@ impl ExecutionPipeline {
                     },
                     mode: BranchMode::Soft,
                     state: branch_state,
-                    messages: Vec::new(),
-                    events: Vec::new(),
+                    messages: branch_messages.remove(&branch_id).unwrap_or_default(),
+                    events: branch_events.remove(&branch_id).unwrap_or_default(),
                     hashchain,
                     deltashot_ids,
                     artifacts: HashSet::new(),
@@ -1965,18 +1991,18 @@ impl ExecutionPipeline {
             if !session.branches.contains_key(&session.active_branch_id) {
                 session.active_branch_id = MAIN_BRANCH_ID.to_owned();
             }
-            let active_branch_id = session.active_branch_id.clone();
-            if load_branch_into_session(&mut session, &active_branch_id).is_err() {
-                session.active_branch_id = MAIN_BRANCH_ID.to_owned();
-                let _ = load_branch_into_session(&mut session, MAIN_BRANCH_ID);
-            }
-            session.messages = persisted_messages;
-            session.events = persisted_events;
-            sync_active_branch_from_session(&mut session);
+            let mut branch_artifacts = HashMap::<String, HashSet<String>>::new();
             if let Ok(artifact_ids) = repo.list_session_artifacts(&session_id).await {
                 for artifact_id in artifact_ids {
                     update_max_id_seed(&mut max_id, &artifact_id);
                     if let Ok(Some(record)) = repo.get_artifact(&artifact_id).await {
+                        let artifact_branch_id = if record.branch_id.is_empty()
+                            || !branch_id_set.contains(&record.branch_id)
+                        {
+                            MAIN_BRANCH_ID.to_owned()
+                        } else {
+                            record.branch_id.clone()
+                        };
                         let versions = record
                             .versions
                             .into_iter()
@@ -1987,16 +2013,29 @@ impl ExecutionPipeline {
                             ArtifactRecord {
                                 artifact_id: record.artifact_id.clone(),
                                 session_id: record.session_id.clone(),
-                                branch_id: record.branch_id,
+                                branch_id: artifact_branch_id.clone(),
                                 artifact_type: record.artifact_type,
                                 created_at: record.created_at,
                                 current_version: record.current_version,
                                 versions,
                             },
                         );
-                        session.artifacts.insert(artifact_id.clone());
+                        branch_artifacts
+                            .entry(artifact_branch_id)
+                            .or_default()
+                            .insert(artifact_id.clone());
                     }
                 }
+            }
+            for branch in session.branches.values_mut() {
+                branch.artifacts = branch_artifacts
+                    .remove(&branch.branch_id)
+                    .unwrap_or_default();
+            }
+            let active_branch_id = session.active_branch_id.clone();
+            if load_branch_into_session(&mut session, &active_branch_id).is_err() {
+                session.active_branch_id = MAIN_BRANCH_ID.to_owned();
+                let _ = load_branch_into_session(&mut session, MAIN_BRANCH_ID);
             }
             recovered_sessions.insert(session_id, session);
         }

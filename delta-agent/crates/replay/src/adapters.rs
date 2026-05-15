@@ -88,6 +88,7 @@ pub struct PersistedArtifactRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSessionMessage {
     pub id: String,
+    #[serde(default)]
     pub branch_id: String,
     pub role: String,
     pub content: String,
@@ -97,6 +98,7 @@ pub struct PersistedSessionMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSessionEvent {
     pub id: String,
+    #[serde(default)]
     pub branch_id: String,
     pub event_type: String,
     pub payload: Value,
