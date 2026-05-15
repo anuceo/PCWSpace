@@ -15,7 +15,7 @@ use deltashot::{
 use futures_util::StreamExt;
 use replay::{
     adapters::{
-        DurableNotionSyncJob, DurableWorkflowJob, PersistedArtifactRecord,
+        DurableNotionSyncJob, DurableWorkflowJob, PersistedAgentLogEntry, PersistedArtifactRecord,
         PersistedArtifactVersion, PersistedSessionEvent, PersistedSessionMessage,
         PersistedSessionMeta, PersistedWorkflowRecord, PersistedWorkspaceRecord,
         RedisVddabRepository,
@@ -682,6 +682,7 @@ struct WorkflowJob {
     payload: String,
     timestamp_ms: u64,
     attempt: u32,
+    durable_entry_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -691,6 +692,7 @@ struct NotionSyncJob {
     artifacts: Vec<String>,
     timestamp_ms: u64,
     attempt: u32,
+    durable_entry_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1675,16 +1677,21 @@ impl ExecutionPipeline {
         };
 
         match self.handle_message_v1(&job.session_id, request).await {
-            Ok(response) => Ok(Some(WorkflowExecutionResult {
-                workflow_id: job.workflow_id,
-                session_id: job.session_id,
-                step: job.step,
-                deltashot_id: response.deltashot.id,
-                state_version: response.state.version,
-            })),
+            Ok(response) => {
+                self.ack_workflow_job_if_needed(&job, source).await;
+                Ok(Some(WorkflowExecutionResult {
+                    workflow_id: job.workflow_id,
+                    session_id: job.session_id,
+                    step: job.step,
+                    deltashot_id: response.deltashot.id,
+                    state_version: response.state.version,
+                }))
+            }
             Err(error) => {
                 if matches!(error, PipelineError::LockUnavailable) {
                     self.requeue_workflow_job(job, source).await;
+                } else {
+                    self.ack_workflow_job_if_needed(&job, source).await;
                 }
                 Err(error)
             }
@@ -1716,6 +1723,7 @@ impl ExecutionPipeline {
                 return Err(error);
             }
         };
+        self.ack_notion_job_if_needed(&job, source).await;
 
         let preview = job.summary.chars().take(140).collect::<String>();
         info!(
@@ -1825,7 +1833,9 @@ impl ExecutionPipeline {
     }
 
     async fn requeue_notion_sync_job(&self, mut job: NotionSyncJob, source: WorkflowJobSource) {
+        self.ack_notion_job_if_needed(&job, source).await;
         job.attempt += 1;
+        job.durable_entry_id = None;
         if job.attempt >= self.notion_sync_config.max_attempts {
             warn!(
                 session_id = %job.session_id,
@@ -1890,8 +1900,37 @@ impl ExecutionPipeline {
         session_id: &str,
     ) -> Result<Vec<AgentLogEntry>, PipelineError> {
         self.ensure_session_exists(session_id).await?;
-        let logs = self.agent_logs.read().await;
-        Ok(logs.get(session_id).cloned().unwrap_or_default())
+        let mut merged = {
+            let logs = self.agent_logs.read().await;
+            logs.get(session_id).cloned().unwrap_or_default()
+        };
+        if let Some(repo) = self.persistence_backend().await {
+            match repo.load_agent_logs(session_id).await {
+                Ok(persisted) => {
+                    merged.extend(persisted.into_iter().map(|entry| AgentLogEntry {
+                        ts: entry.ts,
+                        selected_agent: entry.selected_agent,
+                        reason: entry.reason,
+                    }));
+                }
+                Err(err) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %err,
+                        "failed to load persisted agent logs"
+                    );
+                }
+            }
+        }
+        merged.sort_by(|a, b| {
+            a.ts.cmp(&b.ts)
+                .then_with(|| a.selected_agent.cmp(&b.selected_agent))
+                .then_with(|| a.reason.cmp(&b.reason))
+        });
+        merged.dedup_by(|a, b| {
+            a.ts == b.ts && a.selected_agent == b.selected_agent && a.reason == b.reason
+        });
+        Ok(merged)
     }
 
     pub async fn get_trace(&self, session_id: &str) -> Result<ExecutionTrace, PipelineError> {
@@ -2040,6 +2079,7 @@ impl ExecutionPipeline {
         let mut recovered_deltashots = HashMap::<String, DeltashotRecord>::new();
         let mut recovered_sessions = HashMap::<String, SessionRecord>::new();
         let mut recovered_artifacts = HashMap::<String, ArtifactRecord>::new();
+        let mut recovered_agent_logs = HashMap::<String, Vec<AgentLogEntry>>::new();
 
         for session_id in session_ids {
             update_max_id_seed(&mut max_id, &session_id);
@@ -2089,6 +2129,33 @@ impl ExecutionPipeline {
                         .forced_agent_reason
                         .unwrap_or_else(|| "persisted".to_owned()),
                 });
+            }
+            match repo.load_agent_logs(&session_id).await {
+                Ok(mut entries) => {
+                    entries.sort_by(|a, b| {
+                        a.ts.cmp(&b.ts)
+                            .then_with(|| a.selected_agent.cmp(&b.selected_agent))
+                            .then_with(|| a.reason.cmp(&b.reason))
+                    });
+                    recovered_agent_logs.insert(
+                        session_id.clone(),
+                        entries
+                            .into_iter()
+                            .map(|entry| AgentLogEntry {
+                                ts: entry.ts,
+                                selected_agent: entry.selected_agent,
+                                reason: entry.reason,
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %err,
+                        "failed to hydrate session agent logs"
+                    );
+                }
             }
             let mut branch_messages = HashMap::<String, Vec<ChatMessage>>::new();
             match repo.load_session_messages(&session_id).await {
@@ -2376,6 +2443,12 @@ impl ExecutionPipeline {
             let mut links = self.workspace_sessions.write().await;
             for (workspace_id, entries) in recovered_workspace_sessions {
                 links.entry(workspace_id).or_insert(entries);
+            }
+        }
+        {
+            let mut logs = self.agent_logs.write().await;
+            for (session_id, entries) in recovered_agent_logs {
+                logs.entry(session_id).or_insert(entries);
             }
         }
         seed_counter(&self.id_counter, max_id.saturating_add(1));
@@ -3772,6 +3845,7 @@ impl ExecutionPipeline {
             payload: payload.to_string(),
             timestamp_ms: now,
             attempt: 0,
+            durable_entry_id: None,
         };
         if !self.enqueue_workflow_durable(&job).await {
             let mut queue = self.workflow_queue.lock().await;
@@ -3812,7 +3886,7 @@ impl ExecutionPipeline {
     async fn next_workflow_job(&self) -> (Option<WorkflowJob>, WorkflowJobSource) {
         if let Some(repo) = self.persistence_backend().await {
             match repo.dequeue_workflow_job().await {
-                Ok(Some(job)) => {
+                Ok(Some((entry_id, job))) => {
                     return (
                         Some(WorkflowJob {
                             workflow_id: job.workflow_id,
@@ -3821,6 +3895,7 @@ impl ExecutionPipeline {
                             payload: job.payload,
                             timestamp_ms: job.timestamp_ms,
                             attempt: job.attempt,
+                            durable_entry_id: Some(entry_id),
                         }),
                         WorkflowJobSource::Durable,
                     );
@@ -3842,7 +3917,9 @@ impl ExecutionPipeline {
     }
 
     async fn requeue_workflow_job(&self, mut job: WorkflowJob, source: WorkflowJobSource) {
+        self.ack_workflow_job_if_needed(&job, source).await;
         job.attempt = job.attempt.saturating_add(1);
+        job.durable_entry_id = None;
         if matches!(source, WorkflowJobSource::Durable) {
             if self.enqueue_workflow_durable(&job).await {
                 return;
@@ -3881,7 +3958,7 @@ impl ExecutionPipeline {
     async fn next_notion_sync_job(&self) -> (Option<NotionSyncJob>, WorkflowJobSource) {
         if let Some(repo) = self.persistence_backend().await {
             match repo.dequeue_notion_sync_job().await {
-                Ok(Some(job)) => {
+                Ok(Some((entry_id, job))) => {
                     return (
                         Some(NotionSyncJob {
                             session_id: job.session_id,
@@ -3889,6 +3966,7 @@ impl ExecutionPipeline {
                             artifacts: job.artifacts,
                             timestamp_ms: job.timestamp_ms,
                             attempt: job.attempt,
+                            durable_entry_id: Some(entry_id),
                         }),
                         WorkflowJobSource::Durable,
                     );
@@ -3928,6 +4006,56 @@ impl ExecutionPipeline {
         }
     }
 
+    async fn ack_workflow_job_if_needed(&self, job: &WorkflowJob, source: WorkflowJobSource) {
+        if !matches!(source, WorkflowJobSource::Durable) {
+            return;
+        }
+        let Some(entry_id) = job.durable_entry_id.as_deref() else {
+            return;
+        };
+        let Some(repo) = self.persistence_backend().await else {
+            warn!(
+                workflow_id = %job.workflow_id,
+                entry_id = %entry_id,
+                "persistence backend unavailable for workflow ack"
+            );
+            return;
+        };
+        if let Err(err) = repo.ack_workflow_job_entry(entry_id).await {
+            warn!(
+                workflow_id = %job.workflow_id,
+                entry_id = %entry_id,
+                error = %err,
+                "failed to ack workflow queue entry"
+            );
+        }
+    }
+
+    async fn ack_notion_job_if_needed(&self, job: &NotionSyncJob, source: WorkflowJobSource) {
+        if !matches!(source, WorkflowJobSource::Durable) {
+            return;
+        }
+        let Some(entry_id) = job.durable_entry_id.as_deref() else {
+            return;
+        };
+        let Some(repo) = self.persistence_backend().await else {
+            warn!(
+                session_id = %job.session_id,
+                entry_id = %entry_id,
+                "persistence backend unavailable for notion ack"
+            );
+            return;
+        };
+        if let Err(err) = repo.ack_notion_sync_job_entry(entry_id).await {
+            warn!(
+                session_id = %job.session_id,
+                entry_id = %entry_id,
+                error = %err,
+                "failed to ack notion queue entry"
+            );
+        }
+    }
+
     async fn append_agent_log(&self, session_id: &str, agent: &AgentKind, reason: &str) {
         let entry = AgentLogEntry {
             ts: now_ms(),
@@ -3940,7 +4068,25 @@ impl ExecutionPipeline {
         };
 
         let mut logs = self.agent_logs.write().await;
-        logs.entry(session_id.to_owned()).or_default().push(entry);
+        logs.entry(session_id.to_owned())
+            .or_default()
+            .push(entry.clone());
+        drop(logs);
+
+        if let Some(repo) = self.persistence_backend().await {
+            let persisted = PersistedAgentLogEntry {
+                ts: entry.ts,
+                selected_agent: entry.selected_agent,
+                reason: entry.reason,
+            };
+            if let Err(err) = repo.append_agent_log(session_id, &persisted).await {
+                warn!(
+                    session_id = %session_id,
+                    error = %err,
+                    "failed to persist agent log entry"
+                );
+            }
+        }
     }
 
     async fn enqueue_notion_sync(
@@ -3967,6 +4113,7 @@ impl ExecutionPipeline {
                 .collect::<Vec<_>>(),
             timestamp_ms: now,
             attempt: 0,
+            durable_entry_id: None,
         };
         if self.enqueue_notion_sync_durable(&job).await {
             info!(session_id = %session_id, "notion sync durably enqueued");

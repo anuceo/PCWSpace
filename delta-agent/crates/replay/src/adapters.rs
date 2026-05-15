@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::process;
 
 use anyhow::{anyhow, Context, Result};
-use delta_core::redis_schema::RedisKeyspace;
+use delta_core::redis_schema::{RedisKeyspace, NOTION_SYNC_WORKERS_GROUP, WORKFLOW_WORKERS_GROUP};
 use deltashot::{DeltaShot, Metadata, Op};
 use redis::aio::ConnectionManager;
 use redis::Script;
@@ -19,6 +20,7 @@ pub struct RedisVddabRepository {
     keyspace: RedisKeyspace,
     deltashot_store: DeltaShotStore,
     snapshot_store: SnapshotStore,
+    consumer_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +111,13 @@ pub struct PersistedSessionEvent {
     pub timestamp: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedAgentLogEntry {
+    pub ts: u64,
+    pub selected_agent: String,
+    pub reason: String,
+}
+
 impl RedisVddabRepository {
     pub async fn connect(
         redis_url: &str,
@@ -128,6 +137,7 @@ impl RedisVddabRepository {
             keyspace,
             deltashot_store: DeltaShotStore::new(root.clone()),
             snapshot_store: SnapshotStore::new(root),
+            consumer_name: build_consumer_name(),
         })
     }
 
@@ -1215,9 +1225,10 @@ impl RedisVddabRepository {
         self.enqueue_stream_payload(&key, job).await
     }
 
-    pub async fn dequeue_workflow_job(&self) -> Result<Option<DurableWorkflowJob>> {
+    pub async fn dequeue_workflow_job(&self) -> Result<Option<(String, DurableWorkflowJob)>> {
         let key = self.keyspace.workflow_queue();
-        self.dequeue_stream_payload(&key).await
+        self.read_stream_group_payload(&key, WORKFLOW_WORKERS_GROUP)
+            .await
     }
 
     pub async fn enqueue_notion_sync_job(&self, job: &DurableNotionSyncJob) -> Result<()> {
@@ -1225,9 +1236,42 @@ impl RedisVddabRepository {
         self.enqueue_stream_payload(&key, job).await
     }
 
-    pub async fn dequeue_notion_sync_job(&self) -> Result<Option<DurableNotionSyncJob>> {
+    pub async fn dequeue_notion_sync_job(&self) -> Result<Option<(String, DurableNotionSyncJob)>> {
         let key = self.keyspace.notion_sync_queue();
-        self.dequeue_stream_payload(&key).await
+        self.read_stream_group_payload(&key, NOTION_SYNC_WORKERS_GROUP)
+            .await
+    }
+
+    pub async fn ack_workflow_job_entry(&self, entry_id: &str) -> Result<()> {
+        let key = self.keyspace.workflow_queue();
+        self.ack_stream_group_entry(&key, WORKFLOW_WORKERS_GROUP, entry_id)
+            .await
+    }
+
+    pub async fn ack_notion_sync_job_entry(&self, entry_id: &str) -> Result<()> {
+        let key = self.keyspace.notion_sync_queue();
+        self.ack_stream_group_entry(&key, NOTION_SYNC_WORKERS_GROUP, entry_id)
+            .await
+    }
+
+    pub async fn append_agent_log(
+        &self,
+        session_id: &str,
+        entry: &PersistedAgentLogEntry,
+    ) -> Result<()> {
+        let key = self
+            .keyspace
+            .session_agent_responses(session_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        self.enqueue_stream_payload(&key, entry).await
+    }
+
+    pub async fn load_agent_logs(&self, session_id: &str) -> Result<Vec<PersistedAgentLogEntry>> {
+        let key = self
+            .keyspace
+            .session_agent_responses(session_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        self.load_stream_payloads(&key).await
     }
 
     async fn enqueue_stream_payload<T: Serialize>(&self, key: &str, payload: &T) -> Result<()> {
@@ -1268,36 +1312,120 @@ impl RedisVddabRepository {
         Ok(decoded)
     }
 
-    async fn dequeue_stream_payload<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+    async fn ensure_stream_group(&self, key: &str, group: &str) -> Result<()> {
         let mut conn = self.redis.clone();
-        let range: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+        let create_result = redis::cmd("XGROUP")
+            .arg("CREATE")
             .arg(key)
-            .arg("-")
-            .arg("+")
+            .arg(group)
+            .arg("0")
+            .arg("MKSTREAM")
+            .query_async::<Option<String>>(&mut conn)
+            .await;
+        match create_result {
+            Ok(_) => Ok(()),
+            Err(err) if err.to_string().contains("BUSYGROUP") => Ok(()),
+            Err(err) => Err(anyhow!(err)).with_context(|| {
+                format!("failed to ensure stream group '{}' for '{}'", group, key)
+            }),
+        }
+    }
+
+    async fn read_stream_group_payload<T: DeserializeOwned>(
+        &self,
+        key: &str,
+        group: &str,
+    ) -> Result<Option<(String, T)>> {
+        self.ensure_stream_group(key, group).await?;
+        let mut conn = self.redis.clone();
+        let pending: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg(&self.consumer_name)
             .arg("COUNT")
             .arg(1)
+            .arg("STREAMS")
+            .arg(key)
+            .arg("0")
             .query_async(&mut conn)
             .await
-            .with_context(|| format!("failed to read stream payload for key '{}'", key))?;
+            .with_context(|| {
+                format!(
+                    "failed to read pending group payload for key '{}' group '{}'",
+                    key, group
+                )
+            })?;
+        if let Some(item) = decode_stream_read_reply::<T>(pending)? {
+            return Ok(Some(item));
+        }
 
-        let Some(entry) = range.ids.into_iter().next() else {
-            return Ok(None);
-        };
-        let payload = entry
-            .map
-            .get("payload")
-            .and_then(|value| redis::from_redis_value::<String>(value).ok())
-            .ok_or_else(|| anyhow!("stream entry {} missing payload field", entry.id))?;
-        let decoded = serde_json::from_str::<T>(&payload)
-            .with_context(|| format!("invalid stream payload in key '{}'", key))?;
+        let read: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg(&self.consumer_name)
+            .arg("COUNT")
+            .arg(1)
+            .arg("STREAMS")
+            .arg(key)
+            .arg(">")
+            .query_async(&mut conn)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to read group payload for key '{}' group '{}'",
+                    key, group
+                )
+            })?;
+        decode_stream_read_reply(read)
+    }
+
+    async fn ack_stream_group_entry(&self, key: &str, group: &str, entry_id: &str) -> Result<()> {
+        self.ensure_stream_group(key, group).await?;
+        let mut conn = self.redis.clone();
+        let _: i64 = redis::cmd("XACK")
+            .arg(key)
+            .arg(group)
+            .arg(entry_id)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to ack stream payload for key '{}' group '{}' entry '{}'",
+                    key, group, entry_id
+                )
+            })?;
         let _: i64 = redis::cmd("XDEL")
             .arg(key)
-            .arg(&entry.id)
+            .arg(entry_id)
             .query_async(&mut conn)
             .await
-            .with_context(|| format!("failed to ack stream payload for key '{}'", key))?;
-        Ok(Some(decoded))
+            .with_context(|| format!("failed to trim acked stream entry '{}'", entry_id))?;
+        Ok(())
     }
+}
+
+fn decode_stream_read_reply<T: DeserializeOwned>(
+    reply: redis::streams::StreamReadReply,
+) -> Result<Option<(String, T)>> {
+    for stream_key in reply.keys {
+        for entry in stream_key.ids {
+            if let Some(payload) = entry
+                .map
+                .get("payload")
+                .and_then(|value| redis::from_redis_value::<String>(value).ok())
+            {
+                let decoded = serde_json::from_str::<T>(&payload)
+                    .context("invalid stream payload in consumer group read")?;
+                return Ok(Some((entry.id, decoded)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn build_consumer_name() -> String {
+    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "node".to_owned());
+    format!("{hostname}-{}", process::id())
 }
 
 impl DeltaRepository for RedisVddabRepository {

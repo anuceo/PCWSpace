@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use crate::errors::CoreError;
 
 pub const WORKFLOW_WORKERS_GROUP: &str = "workflow_workers";
+pub const NOTION_SYNC_WORKERS_GROUP: &str = "notion_sync_workers";
 pub const LOCK_TTL_MIN_SECS: u64 = 5;
 pub const LOCK_TTL_MAX_SECS: u64 = 30;
 pub const SNAPSHOT_INTERVAL_EVENTS: u64 = 100;
