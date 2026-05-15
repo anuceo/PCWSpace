@@ -61,18 +61,13 @@ impl PipelineError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageMode {
+    #[default]
     Chat,
     Workflow,
     Execution,
-}
-
-impl Default for MessageMode {
-    fn default() -> Self {
-        Self::Chat
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,17 +377,12 @@ pub struct BranchAuditResponse {
     pub replay: ReplayAuditResult,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BranchMode {
+    #[default]
     Soft,
     Hard,
-}
-
-impl Default for BranchMode {
-    fn default() -> Self {
-        Self::Soft
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -550,8 +540,8 @@ struct SessionState {
 #[derive(Debug, Clone)]
 struct SessionRecord {
     session_id: String,
-    workspace_id: String,
-    name: String,
+    _workspace_id: String,
+    _name: String,
     created_at: u64,
     status: String,
     workflow_id: Option<String>,
@@ -570,8 +560,8 @@ impl SessionRecord {
     fn new(session_id: String, workspace_id: String, name: String) -> Self {
         let mut record = Self {
             session_id,
-            workspace_id,
-            name,
+            _workspace_id: workspace_id,
+            _name: name,
             created_at: now_ms(),
             status: "active".to_owned(),
             workflow_id: None,
@@ -593,9 +583,9 @@ impl SessionRecord {
 #[derive(Debug, Clone)]
 struct BranchRecord {
     branch_id: String,
-    session_id: String,
-    parent_deltashot_id: String,
-    created_at: u64,
+    _session_id: String,
+    _parent_deltashot_id: String,
+    _created_at: u64,
     label: Option<String>,
     mode: BranchMode,
     state: SessionState,
@@ -809,7 +799,7 @@ impl ExecutionPipeline {
     ) -> Vec<SessionView> {
         let idx = self.workspace_sessions.read().await;
         let mut refs = idx.get(workspace_id).cloned().unwrap_or_default();
-        refs.sort_by(|a, b| b.0.cmp(&a.0));
+        refs.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
         let refs = if let Some(cursor_ts) = cursor {
             refs.into_iter()
@@ -1664,9 +1654,7 @@ impl ExecutionPipeline {
     }
 
     async fn persistence_backend(&self) -> Option<RedisVddabRepository> {
-        let Some(config) = self.persistence.as_ref() else {
-            return None;
-        };
+        let config = self.persistence.as_ref()?;
         match RedisVddabRepository::connect(
             &config.redis_url,
             self.keyspace.clone(),
@@ -1706,7 +1694,7 @@ impl ExecutionPipeline {
                 );
                 return;
             }
-            if state.version > 0 && state.version % SNAPSHOT_INTERVAL_EVENTS == 0 {
+            if state.version > 0 && state.version.is_multiple_of(SNAPSHOT_INTERVAL_EVENTS) {
                 if let Err(err) = repo
                     .store_snapshot(branch_id, state.version as usize, &value)
                     .await
@@ -1764,7 +1752,10 @@ impl ExecutionPipeline {
                 );
             }
             if record.state_snapshot.version > 0
-                && record.state_snapshot.version % SNAPSHOT_INTERVAL_EVENTS == 0
+                && record
+                    .state_snapshot
+                    .version
+                    .is_multiple_of(SNAPSHOT_INTERVAL_EVENTS)
             {
                 if let Err(err) = repo
                     .store_snapshot(
@@ -1860,9 +1851,9 @@ impl ExecutionPipeline {
         let parent_timestamp = parent_snapshot.1;
         let new_branch = BranchRecord {
             branch_id: branch_id.clone(),
-            session_id: session_id.to_owned(),
-            parent_deltashot_id: request.from_deltashot_id.clone(),
-            created_at: now_ms(),
+            _session_id: session_id.to_owned(),
+            _parent_deltashot_id: request.from_deltashot_id.clone(),
+            _created_at: now_ms(),
             label: Some(request.label),
             mode: request.mode.clone(),
             state: parent_state.clone(),
@@ -1940,7 +1931,7 @@ impl ExecutionPipeline {
             .collect::<Vec<_>>();
 
         branches.sort_by(|a, b| a.branch_id.cmp(&b.branch_id));
-        branches.sort_by(|a, b| b.is_main.cmp(&a.is_main));
+        branches.sort_by_key(|entry| std::cmp::Reverse(entry.is_main));
 
         Ok(BranchListResponse { branches })
     }
@@ -2686,6 +2677,12 @@ impl ExecutionPipeline {
         let session_id = session_id.to_owned();
         tokio::spawn(async move {
             let mut q = queue.lock().await;
+            info!(
+                session_id = %job.session_id,
+                summary = %job.summary,
+                artifacts_count = job.artifacts.len(),
+                "notion sync job recorded"
+            );
             q.push(job);
             info!(session_id = %session_id, "notion sync enqueued");
         });
@@ -2962,9 +2959,9 @@ fn ensure_session_branches(session: &mut SessionRecord) {
     if !session.branches.contains_key(MAIN_BRANCH_ID) {
         let main = BranchRecord {
             branch_id: MAIN_BRANCH_ID.to_owned(),
-            session_id: session.session_id.clone(),
-            parent_deltashot_id: session.deltashot_ids.first().cloned().unwrap_or_default(),
-            created_at: session.created_at,
+            _session_id: session.session_id.clone(),
+            _parent_deltashot_id: session.deltashot_ids.first().cloned().unwrap_or_default(),
+            _created_at: session.created_at,
             label: None,
             mode: BranchMode::Soft,
             state: session.state.clone(),
