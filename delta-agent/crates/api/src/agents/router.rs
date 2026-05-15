@@ -1,4 +1,4 @@
-use crate::agents::client::{AgentClient, AgentHttpClient, DisabledAgentClient};
+use crate::agents::client::{AgentClient, AgentHttpClient};
 use crate::agents::config::AgentRuntimeConfig;
 use crate::agents::errors::AgentError;
 use crate::agents::providers::{claude::ClaudeClient, deepseek::DeepSeekClient};
@@ -22,8 +22,9 @@ impl RealAgentRouter {
         request: AgentRequest,
     ) -> Result<AgentResult, AgentError> {
         if !self.config.use_real_agents {
-            let disabled = DisabledAgentClient::new(provider);
-            return disabled.complete(request).await;
+            return Err(AgentError::Configuration(
+                "real agents are disabled (set DELTA_AGENT_USE_REAL_AGENTS=true)".to_owned(),
+            ));
         }
         match provider {
             AgentProvider::Claude => {
@@ -43,8 +44,9 @@ impl RealAgentRouter {
         request: AgentRequest,
     ) -> Result<AgentStream, AgentError> {
         if !self.config.use_real_agents {
-            let disabled = DisabledAgentClient::new(provider);
-            return disabled.stream(request).await;
+            return Err(AgentError::Configuration(
+                "real agents are disabled (set DELTA_AGENT_USE_REAL_AGENTS=true)".to_owned(),
+            ));
         }
         match provider {
             AgentProvider::Claude => {

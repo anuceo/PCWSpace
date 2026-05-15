@@ -316,7 +316,9 @@ A Notion queue pull (`POST /workflows/notion/execute-next`) returns:
   "result": {
     "session_id": "sess_456",
     "artifacts_count": 2,
-    "summary_preview": "Here is the generated update..."
+    "summary_preview": "Here is the generated update...",
+    "status": "synced",
+    "detail": "notion page updated"
   },
   "meta": {
     "request_id": "req_123",
@@ -326,7 +328,7 @@ A Notion queue pull (`POST /workflows/notion/execute-next`) returns:
 }
 ```
 
-Operational note: Notion outbound sync is integration-gated at runtime (`NOTION_SYNC_ENABLED=true` plus token/parent configuration). When disabled or incomplete, the job is still consumed and logged to keep queue flow deterministic.
+Operational note: Notion outbound sync is integration-gated at runtime (`NOTION_SYNC_ENABLED=true` plus token/parent configuration). When disabled or incomplete, notion jobs are not enqueued and API responses record `NOTION_SYNC_SKIPPED`.
 
 ---
 

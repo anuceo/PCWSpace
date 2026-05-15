@@ -1269,10 +1269,19 @@ impl ExecutionPipeline {
             .await?;
         }
 
-        self.enqueue_notion_sync(session_id, &agent_output.text, &artifacts)
+        let notion_enqueued = self
+            .enqueue_notion_sync(session_id, &agent_output.text, &artifacts)
             .await;
-        self.record_execution_step(session_id, "NOTION_SYNC_ENQUEUED", Value::Null)
-            .await?;
+        self.record_execution_step(
+            session_id,
+            if notion_enqueued {
+                "NOTION_SYNC_ENQUEUED"
+            } else {
+                "NOTION_SYNC_SKIPPED"
+            },
+            Value::Null,
+        )
+        .await?;
 
         info!(
             session_id = %session_id,
@@ -3080,67 +3089,86 @@ impl ExecutionPipeline {
             context.forced_agent.as_ref(),
         );
         self.append_agent_log(session_id, &agent, &reason).await;
+        let mut accumulated = if self.agent_runtime_config.use_real_agents {
+            let provider = map_agent_kind(agent);
+            let router =
+                RealAgentRouter::new(self.agent_runtime_config.clone()).map_err(map_agent_error)?;
+            let mut stream = router
+                .stream(
+                    provider,
+                    AgentRequest {
+                        session_id: session_id.to_owned(),
+                        request_id: format!("req_{}", uuid::Uuid::new_v4().simple()),
+                        prompt: request.content.clone(),
+                        context: context
+                            .memory
+                            .iter()
+                            .rev()
+                            .map(|message| ClientAgentMessage {
+                                role: message.role.clone(),
+                                content: message.content.clone(),
+                            })
+                            .collect::<Vec<_>>(),
+                        metadata: request.metadata.clone(),
+                        mode: map_message_mode(&request.mode),
+                        model_override: None,
+                        max_tokens: None,
+                        temperature: None,
+                    },
+                )
+                .await
+                .map_err(map_agent_error)?;
 
-        if !self.agent_runtime_config.use_real_agents {
-            return Err(PipelineError::InvalidInput(
-                "DELTA_AGENT_USE_REAL_AGENTS must be true for streaming".to_owned(),
-            ));
-        }
-
-        let provider = map_agent_kind(agent);
-        let router =
-            RealAgentRouter::new(self.agent_runtime_config.clone()).map_err(map_agent_error)?;
-        let mut stream = router
-            .stream(
-                provider,
-                AgentRequest {
-                    session_id: session_id.to_owned(),
-                    request_id: format!("req_{}", uuid::Uuid::new_v4().simple()),
-                    prompt: request.content.clone(),
-                    context: context
-                        .memory
-                        .iter()
-                        .rev()
-                        .map(|message| ClientAgentMessage {
-                            role: message.role.clone(),
-                            content: message.content.clone(),
-                        })
-                        .collect::<Vec<_>>(),
-                    metadata: request.metadata.clone(),
-                    mode: map_message_mode(&request.mode),
-                    model_override: None,
-                    max_tokens: None,
-                    temperature: None,
-                },
-            )
-            .await
-            .map_err(map_agent_error)?;
-
-        let mut accumulated = String::new();
-        let mut saw_done = false;
-        while let Some(event) = stream.next().await {
-            match event.map_err(map_agent_error)? {
-                crate::agents::types::AgentStreamEvent::Token { delta } => {
-                    accumulated.push_str(&delta);
-                    events.push(stream_event(
-                        "token",
-                        StreamTokenEvent {
-                            delta,
-                            accumulated: accumulated.clone(),
-                        },
-                    ));
-                }
-                crate::agents::types::AgentStreamEvent::Usage { .. } => {}
-                crate::agents::types::AgentStreamEvent::Done { .. } => {
-                    saw_done = true;
-                    break;
+            let mut accumulated = String::new();
+            let mut saw_done = false;
+            while let Some(event) = stream.next().await {
+                match event.map_err(map_agent_error)? {
+                    crate::agents::types::AgentStreamEvent::Token { delta } => {
+                        accumulated.push_str(&delta);
+                        events.push(stream_event(
+                            "token",
+                            StreamTokenEvent {
+                                delta,
+                                accumulated: accumulated.clone(),
+                            },
+                        ));
+                    }
+                    crate::agents::types::AgentStreamEvent::Usage { .. } => {}
+                    crate::agents::types::AgentStreamEvent::Done { .. } => {
+                        saw_done = true;
+                        break;
+                    }
                 }
             }
-        }
-        if !saw_done {
-            return Err(PipelineError::Internal(
-                "agent stream completed without done event".to_owned(),
-            ));
+            if !saw_done {
+                return Err(PipelineError::Internal(
+                    "agent stream completed without done event".to_owned(),
+                ));
+            }
+            accumulated
+        } else {
+            let generated =
+                build_local_agent_response(&request.content, &context, &request.mode, agent);
+            let mut accumulated = String::new();
+            for delta in local_stream_chunks(&generated) {
+                accumulated.push_str(&delta);
+                events.push(stream_event(
+                    "token",
+                    StreamTokenEvent {
+                        delta,
+                        accumulated: accumulated.clone(),
+                    },
+                ));
+            }
+            if accumulated.is_empty() {
+                generated
+            } else {
+                accumulated
+            }
+        };
+        if accumulated.trim().is_empty() {
+            accumulated =
+                build_local_agent_response(&request.content, &context, &request.mode, agent);
         }
         let agent_output =
             build_agent_output_from_text(&request.content, &context, &request.mode, accumulated);
@@ -3245,21 +3273,14 @@ impl ExecutionPipeline {
         agent: AgentKind,
     ) -> Result<AgentOutput, PipelineError> {
         if !self.agent_runtime_config.use_real_agents {
-            #[cfg(test)]
-            {
-                return Ok(build_agent_output_from_text(
-                    &request.content,
-                    context,
-                    &request.mode,
-                    format!("[test-agent] {}", request.content),
-                ));
-            }
-            #[cfg(not(test))]
-            {
-                return Err(PipelineError::InvalidInput(
-                    "DELTA_AGENT_USE_REAL_AGENTS must be true for message execution".to_owned(),
-                ));
-            }
+            let generated =
+                build_local_agent_response(&request.content, context, &request.mode, agent);
+            return Ok(build_agent_output_from_text(
+                &request.content,
+                context,
+                &request.mode,
+                generated,
+            ));
         }
 
         let agent_request = AgentRequest {
@@ -3927,7 +3948,15 @@ impl ExecutionPipeline {
         session_id: &str,
         summary: &str,
         artifacts: &[ArtifactEnvelope],
-    ) {
+    ) -> bool {
+        if !self.notion_sync_config.is_active() {
+            info!(
+                session_id = %session_id,
+                "skipping notion sync enqueue because integration is inactive"
+            );
+            return false;
+        }
+
         let now = now_ms();
         let job = NotionSyncJob {
             session_id: session_id.to_owned(),
@@ -3941,11 +3970,12 @@ impl ExecutionPipeline {
         };
         if self.enqueue_notion_sync_durable(&job).await {
             info!(session_id = %session_id, "notion sync durably enqueued");
-            return;
+            return true;
         }
         let mut queue = self.notion_queue.lock().await;
         queue.push(job);
         info!(session_id = %session_id, "notion sync enqueued in-memory");
+        true
     }
 
     async fn record_execution_step(
@@ -4062,6 +4092,74 @@ fn map_agent_error(error: AgentError) -> PipelineError {
         }
         AgentError::NonRetryable(message) => PipelineError::Internal(message),
     }
+}
+
+fn build_local_agent_response(
+    input: &str,
+    context: &SessionContext,
+    mode: &MessageMode,
+    agent: AgentKind,
+) -> String {
+    let agent_name = match agent {
+        AgentKind::Claude => "claude-local",
+        AgentKind::DeepSeek => "deepseek-local",
+    };
+    let goal = context.state.goal.clone().or_else(|| match mode {
+        MessageMode::Workflow => Some("complete workflow objective".to_owned()),
+        MessageMode::Execution => Some("execute requested operation".to_owned()),
+        MessageMode::Chat => Some("provide useful response".to_owned()),
+    });
+    let step = Some(match mode {
+        MessageMode::Workflow => "workflow-progress".to_owned(),
+        MessageMode::Execution => "execution-progress".to_owned(),
+        MessageMode::Chat => "continue".to_owned(),
+    });
+    let memory_hint = context
+        .memory
+        .last()
+        .map(|message| truncate_for_notion(&message.content, 240))
+        .unwrap_or_else(|| "no prior context".to_owned());
+    let response =
+        format!("({agent_name}) processed request: {input}. Context hint: {memory_hint}");
+    let artifact = if matches!(mode, MessageMode::Execution)
+        || input.to_ascii_lowercase().contains("code")
+        || input.to_ascii_lowercase().contains("artifact")
+    {
+        Some(serde_json::json!({
+            "type": "code",
+            "content": format!("// local-runtime artifact\n// request: {input}\n"),
+        }))
+    } else {
+        None
+    };
+
+    let payload = serde_json::json!({
+        "response": response,
+        "state": {
+            "goal": goal,
+            "step": step,
+        },
+        "artifact": artifact,
+    });
+    serde_json::to_string(&payload).unwrap_or_else(|_| input.to_owned())
+}
+
+fn local_stream_chunks(text: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        current.push(ch);
+        if current.chars().count() >= 32 || ch.is_whitespace() {
+            chunks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() && !text.is_empty() {
+        chunks.push(text.to_owned());
+    }
+    chunks
 }
 
 fn select_agent(

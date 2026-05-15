@@ -1643,7 +1643,9 @@
         "required": [
           "session_id",
           "artifacts_count",
-          "summary_preview"
+          "summary_preview",
+          "status",
+          "detail"
         ],
         "properties": {
           "session_id": {
@@ -1653,6 +1655,12 @@
             "type": "integer"
           },
           "summary_preview": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "detail": {
             "type": "string"
           }
         }

@@ -75,7 +75,7 @@ Supported parent targets:
 - `NOTION_DATABASE_ID` (uses `NOTION_DATABASE_TITLE_PROPERTY`, default `Name`)
 - `NOTION_PARENT_PAGE_ID` (uses `title` property for child page creation)
 
-If Notion integration is disabled or not fully configured, jobs are consumed and logged without outbound sync.
+If Notion integration is disabled or not fully configured, notion jobs are skipped at enqueue time and do not enter the queue.
 
 ## 5) Operational checks
 

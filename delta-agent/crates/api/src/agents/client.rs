@@ -61,39 +61,6 @@ impl AgentHttpClient {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DisabledAgentClient {
-    provider: AgentProvider,
-}
-
-impl DisabledAgentClient {
-    pub fn new(provider: AgentProvider) -> Self {
-        Self { provider }
-    }
-}
-
-impl AgentClient for DisabledAgentClient {
-    fn provider(&self) -> AgentProvider {
-        self.provider
-    }
-
-    fn complete(&self, _request: AgentRequest) -> BoxFuture<'_, Result<AgentResult, AgentError>> {
-        Box::pin(async {
-            Err(AgentError::Configuration(
-                "real agents are disabled (set DELTA_AGENT_USE_REAL_AGENTS=true)".to_owned(),
-            ))
-        })
-    }
-
-    fn stream(&self, _request: AgentRequest) -> BoxFuture<'_, Result<AgentStream, AgentError>> {
-        Box::pin(async {
-            Err(AgentError::Configuration(
-                "real agents are disabled (set DELTA_AGENT_USE_REAL_AGENTS=true)".to_owned(),
-            ))
-        })
-    }
-}
-
 fn truncate_error_body(mut body: String, max_chars: usize) -> String {
     if body.chars().count() <= max_chars {
         return body;
