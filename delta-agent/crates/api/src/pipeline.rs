@@ -12,6 +12,7 @@ use deltashot::{
     apply_ops_to_state, canonical_serialize_ops, compute_chain_hash, compute_diff_ops, DeltaShot,
     DeltaShotMetadata, DeltaShotOp, OpType,
 };
+use futures_util::StreamExt;
 use replay::{
     adapters::RedisVddabRepository,
     verifier::{audit_replay, verify_chain, ReplayAuditResult, VerificationResult},
@@ -2411,21 +2412,83 @@ impl ExecutionPipeline {
         );
         self.append_agent_log(session_id, &agent, &reason).await;
 
-        let agent_output = run_agent(agent, &request.content, &context, &request.mode);
-        let mut accumulated = String::new();
-        for token in tokenize_stream_chunks(&agent_output.text) {
-            if !accumulated.is_empty() {
-                accumulated.push(' ');
+        let agent_output = if self.agent_runtime_config.use_real_agents {
+            let provider = map_agent_kind(agent);
+            let router =
+                RealAgentRouter::new(self.agent_runtime_config.clone()).map_err(map_agent_error)?;
+            let mut stream = router
+                .stream(
+                    provider,
+                    AgentRequest {
+                        session_id: session_id.to_owned(),
+                        request_id: format!("req_{}", uuid::Uuid::new_v4().simple()),
+                        prompt: request.content.clone(),
+                        context: context
+                            .memory
+                            .iter()
+                            .rev()
+                            .map(|message| ClientAgentMessage {
+                                role: message.role.clone(),
+                                content: message.content.clone(),
+                            })
+                            .collect::<Vec<_>>(),
+                        metadata: request.metadata.clone(),
+                        mode: map_message_mode(&request.mode),
+                        model_override: None,
+                        max_tokens: None,
+                        temperature: None,
+                    },
+                )
+                .await
+                .map_err(map_agent_error)?;
+
+            let mut accumulated = String::new();
+            let mut saw_done = false;
+            while let Some(event) = stream.next().await {
+                match event.map_err(map_agent_error)? {
+                    crate::agents::types::AgentStreamEvent::Token { delta } => {
+                        accumulated.push_str(&delta);
+                        events.push(stream_event(
+                            "token",
+                            StreamTokenEvent {
+                                delta,
+                                accumulated: accumulated.clone(),
+                            },
+                        ));
+                    }
+                    crate::agents::types::AgentStreamEvent::Usage { .. } => {}
+                    crate::agents::types::AgentStreamEvent::Done { .. } => {
+                        saw_done = true;
+                        break;
+                    }
+                }
             }
-            accumulated.push_str(&token);
-            events.push(stream_event(
-                "token",
-                StreamTokenEvent {
-                    delta: token,
-                    accumulated: accumulated.clone(),
-                },
-            ));
-        }
+            if !saw_done {
+                return Err(PipelineError::Internal(
+                    "agent stream completed without done event".to_owned(),
+                ));
+            }
+            let mut output = run_agent(agent, &request.content, &context, &request.mode);
+            output.text = accumulated;
+            output
+        } else {
+            let agent_output = run_agent(agent, &request.content, &context, &request.mode);
+            let mut accumulated = String::new();
+            for token in tokenize_stream_chunks(&agent_output.text) {
+                if !accumulated.is_empty() {
+                    accumulated.push(' ');
+                }
+                accumulated.push_str(&token);
+                events.push(stream_event(
+                    "token",
+                    StreamTokenEvent {
+                        delta: token,
+                        accumulated: accumulated.clone(),
+                    },
+                ));
+            }
+            agent_output
+        };
 
         let prev_state = context.state.clone();
         let next_state = apply_state_mutation(&prev_state, &request.content, &agent_output);
@@ -2549,10 +2612,7 @@ impl ExecutionPipeline {
             max_tokens: None,
             temperature: None,
         };
-        let provider = match agent {
-            AgentKind::Claude => AgentProvider::Claude,
-            AgentKind::DeepSeek => AgentProvider::DeepSeek,
-        };
+        let provider = map_agent_kind(agent);
         let router =
             RealAgentRouter::new(self.agent_runtime_config.clone()).map_err(map_agent_error)?;
         let result = router
@@ -3048,6 +3108,13 @@ fn map_message_mode(mode: &MessageMode) -> ClientAgentMode {
         MessageMode::Chat => ClientAgentMode::Chat,
         MessageMode::Workflow => ClientAgentMode::Workflow,
         MessageMode::Execution => ClientAgentMode::Execution,
+    }
+}
+
+fn map_agent_kind(agent: AgentKind) -> AgentProvider {
+    match agent {
+        AgentKind::Claude => AgentProvider::Claude,
+        AgentKind::DeepSeek => AgentProvider::DeepSeek,
     }
 }
 

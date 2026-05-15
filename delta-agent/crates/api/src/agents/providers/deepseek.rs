@@ -1,8 +1,11 @@
 use std::time::Instant;
 
 use futures_util::future::BoxFuture;
+use futures_util::StreamExt;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::agents::client::{AgentClient, AgentHttpClient};
 use crate::agents::config::AgentRuntimeConfig;
@@ -124,12 +127,144 @@ impl AgentClient for DeepSeekClient {
         })
     }
 
-    fn stream(&self, _request: AgentRequest) -> BoxFuture<'_, Result<AgentStream, AgentError>> {
-        Box::pin(async {
-            let _placeholder: Option<AgentStreamEvent> = None;
-            Err(AgentError::NonRetryable(
-                "deepseek streaming client is not wired in phase B".to_owned(),
-            ))
+    fn stream(&self, request: AgentRequest) -> BoxFuture<'_, Result<AgentStream, AgentError>> {
+        Box::pin(async move {
+            let api_key = self.config.deepseek_api_key.clone().ok_or_else(|| {
+                AgentError::Configuration("DEEPSEEK_API_KEY is not set".to_owned())
+            })?;
+            let model = request
+                .model_override
+                .clone()
+                .unwrap_or_else(|| self.config.deepseek_model.clone());
+            let endpoint = format!(
+                "{}/v1/chat/completions",
+                self.config.deepseek_base_url.trim_end_matches('/')
+            );
+            let mut messages = request
+                .context
+                .iter()
+                .map(|message| {
+                    json!({
+                        "role": normalize_chat_role(&message.role),
+                        "content": message.content,
+                    })
+                })
+                .collect::<Vec<_>>();
+            messages.push(json!({
+                "role": "user",
+                "content": request.prompt,
+            }));
+            let payload = json!({
+                "model": model,
+                "messages": messages,
+                "temperature": request.temperature.unwrap_or(0.2),
+                "max_tokens": request.max_tokens.unwrap_or(1024),
+                "stream": true,
+            });
+
+            let response = self
+                .http
+                .inner()
+                .post(endpoint)
+                .header("authorization", format!("Bearer {api_key}"))
+                .header("content-type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|err| AgentError::Transport(err.to_string()))?;
+            let response = AgentHttpClient::ensure_success(response).await?;
+
+            let (tx, rx) = mpsc::unbounded_channel::<Result<AgentStreamEvent, AgentError>>();
+            let idle_timeout = self.config.stream_idle_timeout();
+            tokio::spawn(async move {
+                let mut stream = response.bytes_stream();
+                let mut buffer = String::new();
+                loop {
+                    let next_chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
+                        Ok(item) => item,
+                        Err(_) => {
+                            let _ = tx.send(Err(AgentError::Timeout {
+                                stage: "stream_idle".to_owned(),
+                            }));
+                            return;
+                        }
+                    };
+                    let Some(chunk_result) = next_chunk else {
+                        let _ = tx.send(Err(AgentError::StreamTerminated));
+                        return;
+                    };
+                    let chunk = match chunk_result {
+                        Ok(chunk) => chunk,
+                        Err(err) => {
+                            let _ = tx.send(Err(AgentError::Transport(err.to_string())));
+                            return;
+                        }
+                    };
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some(newline_idx) = buffer.find('\n') {
+                        let line = buffer[..newline_idx].trim_end_matches('\r').to_owned();
+                        buffer.drain(..=newline_idx);
+                        if !line.starts_with("data:") {
+                            continue;
+                        }
+                        let data = line[5..].trim();
+                        if data.is_empty() {
+                            continue;
+                        }
+                        if data == "[DONE]" {
+                            let _ = tx.send(Ok(AgentStreamEvent::Done {
+                                model: model.clone(),
+                                finish_reason: None,
+                            }));
+                            return;
+                        }
+                        let parsed: Value = match serde_json::from_str(data) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                let _ = tx.send(Err(AgentError::Deserialize(err.to_string())));
+                                return;
+                            }
+                        };
+                        if let Some(usage) = parsed.get("usage").cloned() {
+                            let usage = AgentUsage {
+                                input_tokens: usage
+                                    .get("prompt_tokens")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0),
+                                output_tokens: usage
+                                    .get("completion_tokens")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0),
+                                total_tokens: usage
+                                    .get("total_tokens")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0),
+                            };
+                            let _ = tx.send(Ok(AgentStreamEvent::Usage { usage }));
+                        }
+                        if let Some(delta) = parsed
+                            .pointer("/choices/0/delta/content")
+                            .and_then(Value::as_str)
+                        {
+                            let _ = tx.send(Ok(AgentStreamEvent::Token {
+                                delta: delta.to_owned(),
+                            }));
+                        }
+                        if let Some(finish_reason) = parsed
+                            .pointer("/choices/0/finish_reason")
+                            .and_then(Value::as_str)
+                        {
+                            let _ = tx.send(Ok(AgentStreamEvent::Done {
+                                model: model.clone(),
+                                finish_reason: Some(finish_reason.to_owned()),
+                            }));
+                            return;
+                        }
+                    }
+                }
+            });
+            let stream: AgentStream = Box::pin(UnboundedReceiverStream::new(rx));
+            Ok(stream)
         })
     }
 }
