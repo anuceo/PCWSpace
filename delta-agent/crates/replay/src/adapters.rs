@@ -39,6 +39,51 @@ pub struct DurableNotionSyncJob {
     pub attempt: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedWorkspaceRecord {
+    pub workspace_id: String,
+    pub name: String,
+    pub created_at: u64,
+    pub owner_id: String,
+    pub active_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSessionMeta {
+    pub session_id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub created_at: u64,
+    pub status: String,
+    pub workflow_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedWorkflowRecord {
+    pub workflow_id: String,
+    pub session_id: String,
+    pub status: String,
+    pub current_step: String,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedArtifactVersion {
+    pub version: u64,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedArtifactRecord {
+    pub artifact_id: String,
+    pub session_id: String,
+    pub branch_id: String,
+    pub artifact_type: String,
+    pub created_at: u64,
+    pub current_version: u64,
+    pub versions: Vec<PersistedArtifactVersion>,
+}
+
 impl RedisVddabRepository {
     pub async fn connect(
         redis_url: &str,
@@ -488,6 +533,493 @@ impl RedisVddabRepository {
                 )
             })?;
         Ok(active)
+    }
+
+    pub async fn store_workspace(&self, workspace: &PersistedWorkspaceRecord) -> Result<()> {
+        let key = self
+            .keyspace
+            .workspace_meta(&workspace.workspace_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let mut conn = self.redis.clone();
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg("name")
+            .arg(&workspace.name)
+            .arg("created_at")
+            .arg(workspace.created_at.to_string())
+            .arg("owner_id")
+            .arg(&workspace.owner_id)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to persist workspace '{}'", workspace.workspace_id))?;
+        if let Some(active) = workspace.active_session_id.as_ref() {
+            let _: () = redis::cmd("HSET")
+                .arg(&key)
+                .arg("active_session_id")
+                .arg(active)
+                .query_async(&mut conn)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to persist workspace active session '{}'",
+                        workspace.workspace_id
+                    )
+                })?;
+        } else {
+            let _: () = redis::cmd("HDEL")
+                .arg(&key)
+                .arg("active_session_id")
+                .query_async(&mut conn)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to clear workspace active session '{}'",
+                        workspace.workspace_id
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    pub async fn list_workspaces(&self) -> Result<Vec<PersistedWorkspaceRecord>> {
+        let mut cursor = 0u64;
+        let pattern = format!("{}:workspace:*:meta", self.keyspace.env());
+        let mut workspace_ids = HashSet::new();
+        let mut conn = self.redis.clone();
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(256)
+                .query_async(&mut conn)
+                .await
+                .context("failed to scan workspace keys")?;
+            for key in keys {
+                let parts = key.split(':').collect::<Vec<_>>();
+                if parts.len() >= 4 && parts[1] == "workspace" {
+                    workspace_ids.insert(parts[2].to_owned());
+                }
+            }
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
+        }
+        let mut ids = workspace_ids.into_iter().collect::<Vec<_>>();
+        ids.sort();
+
+        let mut result = Vec::new();
+        for workspace_id in ids {
+            if let Some(workspace) = self.get_workspace(&workspace_id).await? {
+                result.push(workspace);
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn get_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<PersistedWorkspaceRecord>> {
+        let key = self
+            .keyspace
+            .workspace_meta(workspace_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let name = self.read_hash_field(&key, "name").await?;
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        let created_at = self
+            .read_hash_field(&key, "created_at")
+            .await?
+            .unwrap_or_else(|| "0".to_owned())
+            .parse::<u64>()
+            .unwrap_or(0);
+        let owner_id = self
+            .read_hash_field(&key, "owner_id")
+            .await?
+            .unwrap_or_else(|| "system".to_owned());
+        let active_session_id = self.read_hash_field(&key, "active_session_id").await?;
+        Ok(Some(PersistedWorkspaceRecord {
+            workspace_id: workspace_id.to_owned(),
+            name,
+            created_at,
+            owner_id,
+            active_session_id,
+        }))
+    }
+
+    pub async fn link_workspace_session(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        created_at: u64,
+    ) -> Result<()> {
+        let key = self
+            .keyspace
+            .workspace_sessions(workspace_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let mut conn = self.redis.clone();
+        let _: () = redis::cmd("ZADD")
+            .arg(key)
+            .arg(created_at.to_string())
+            .arg(session_id)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to link session '{}' to workspace '{}'",
+                    session_id, workspace_id
+                )
+            })?;
+        Ok(())
+    }
+
+    pub async fn get_workspace_sessions(&self, workspace_id: &str) -> Result<Vec<(u64, String)>> {
+        let key = self
+            .keyspace
+            .workspace_sessions(workspace_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let mut conn = self.redis.clone();
+        let values: Vec<(String, f64)> = redis::cmd("ZRANGE")
+            .arg(key)
+            .arg(0)
+            .arg(-1)
+            .arg("WITHSCORES")
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to load workspace sessions '{}'", workspace_id))?;
+        Ok(values
+            .into_iter()
+            .map(|(session_id, score)| (score as u64, session_id))
+            .collect::<Vec<_>>())
+    }
+
+    pub async fn store_session_meta(&self, session: &PersistedSessionMeta) -> Result<()> {
+        let key = self
+            .keyspace
+            .session_meta(&session.session_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let mut conn = self.redis.clone();
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg("workspace_id")
+            .arg(&session.workspace_id)
+            .arg("name")
+            .arg(&session.name)
+            .arg("created_at")
+            .arg(session.created_at.to_string())
+            .arg("status")
+            .arg(&session.status)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to persist session meta '{}'", session.session_id))?;
+        if let Some(workflow_id) = session.workflow_id.as_ref() {
+            let _: () = redis::cmd("HSET")
+                .arg(&key)
+                .arg("workflow_id")
+                .arg(workflow_id)
+                .query_async(&mut conn)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to persist session workflow id '{}'",
+                        session.session_id
+                    )
+                })?;
+        } else {
+            let _: () = redis::cmd("HDEL")
+                .arg(&key)
+                .arg("workflow_id")
+                .query_async(&mut conn)
+                .await
+                .with_context(|| {
+                    format!("failed to clear workflow id for '{}'", session.session_id)
+                })?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_session_meta(&self, session_id: &str) -> Result<Option<PersistedSessionMeta>> {
+        let key = self
+            .keyspace
+            .session_meta(session_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let workspace_id = self.read_hash_field(&key, "workspace_id").await?;
+        let Some(workspace_id) = workspace_id else {
+            return Ok(None);
+        };
+        let name = self
+            .read_hash_field(&key, "name")
+            .await?
+            .unwrap_or_else(|| "Rehydrated Session".to_owned());
+        let created_at = self
+            .read_hash_field(&key, "created_at")
+            .await?
+            .unwrap_or_else(|| "0".to_owned())
+            .parse::<u64>()
+            .unwrap_or(0);
+        let status = self
+            .read_hash_field(&key, "status")
+            .await?
+            .unwrap_or_else(|| "active".to_owned());
+        let workflow_id = self.read_hash_field(&key, "workflow_id").await?;
+        Ok(Some(PersistedSessionMeta {
+            session_id: session_id.to_owned(),
+            workspace_id,
+            name,
+            created_at,
+            status,
+            workflow_id,
+        }))
+    }
+
+    pub async fn store_workflow_state(&self, workflow: &PersistedWorkflowRecord) -> Result<()> {
+        let key = self
+            .keyspace
+            .workflow_state(&workflow.workflow_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let mut conn = self.redis.clone();
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg("session_id")
+            .arg(&workflow.session_id)
+            .arg("status")
+            .arg(&workflow.status)
+            .arg("current_step")
+            .arg(&workflow.current_step)
+            .arg("updated_at")
+            .arg(workflow.updated_at.to_string())
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to persist workflow '{}'", workflow.workflow_id))?;
+        Ok(())
+    }
+
+    pub async fn get_workflow_state(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<PersistedWorkflowRecord>> {
+        let key = self
+            .keyspace
+            .workflow_state(workflow_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let session_id = self.read_hash_field(&key, "session_id").await?;
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let status = self
+            .read_hash_field(&key, "status")
+            .await?
+            .unwrap_or_else(|| "active".to_owned());
+        let current_step = self
+            .read_hash_field(&key, "current_step")
+            .await?
+            .unwrap_or_else(|| "start".to_owned());
+        let updated_at = self
+            .read_hash_field(&key, "updated_at")
+            .await?
+            .unwrap_or_else(|| "0".to_owned())
+            .parse::<u64>()
+            .unwrap_or(0);
+        Ok(Some(PersistedWorkflowRecord {
+            workflow_id: workflow_id.to_owned(),
+            session_id,
+            status,
+            current_step,
+            updated_at,
+        }))
+    }
+
+    pub async fn list_workflow_ids(&self) -> Result<Vec<String>> {
+        let mut cursor = 0u64;
+        let pattern = format!("{}:workflow:*:state", self.keyspace.env());
+        let mut workflow_ids = HashSet::new();
+        let mut conn = self.redis.clone();
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(256)
+                .query_async(&mut conn)
+                .await
+                .context("failed to scan workflow keys")?;
+            for key in keys {
+                let parts = key.split(':').collect::<Vec<_>>();
+                if parts.len() >= 4 && parts[1] == "workflow" {
+                    workflow_ids.insert(parts[2].to_owned());
+                }
+            }
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
+        }
+        let mut ids = workflow_ids.into_iter().collect::<Vec<_>>();
+        ids.sort();
+        Ok(ids)
+    }
+
+    pub async fn store_artifact(&self, artifact: &PersistedArtifactRecord) -> Result<()> {
+        let meta_key = self
+            .keyspace
+            .artifact_meta(&artifact.artifact_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let versions_key = self
+            .keyspace
+            .artifact_versions(&artifact.artifact_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let session_artifacts_key = self
+            .keyspace
+            .session_artifacts(&artifact.session_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let mut conn = self.redis.clone();
+        let _: () = redis::cmd("HSET")
+            .arg(&meta_key)
+            .arg("session_id")
+            .arg(&artifact.session_id)
+            .arg("branch_id")
+            .arg(&artifact.branch_id)
+            .arg("artifact_type")
+            .arg(&artifact.artifact_type)
+            .arg("created_at")
+            .arg(artifact.created_at.to_string())
+            .arg("current_version")
+            .arg(artifact.current_version.to_string())
+            .query_async(&mut conn)
+            .await
+            .with_context(|| {
+                format!("failed to persist artifact meta '{}'", artifact.artifact_id)
+            })?;
+        let _: () = redis::cmd("SADD")
+            .arg(session_artifacts_key)
+            .arg(&artifact.artifact_id)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to link artifact '{}'", artifact.artifact_id))?;
+        for version in &artifact.versions {
+            let version_id = version.version.to_string();
+            let content_key = self
+                .keyspace
+                .artifact_version_content(&artifact.artifact_id, &version_id)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            let _: () = redis::cmd("SET")
+                .arg(content_key)
+                .arg(&version.content)
+                .query_async(&mut conn)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to persist artifact content '{}' version {}",
+                        artifact.artifact_id, version.version
+                    )
+                })?;
+            let _: () = redis::cmd("ZADD")
+                .arg(&versions_key)
+                .arg(version.version.to_string())
+                .arg(&version_id)
+                .query_async(&mut conn)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to persist artifact version '{}' version {}",
+                        artifact.artifact_id, version.version
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_artifact(&self, artifact_id: &str) -> Result<Option<PersistedArtifactRecord>> {
+        let meta_key = self
+            .keyspace
+            .artifact_meta(artifact_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let session_id = self.read_hash_field(&meta_key, "session_id").await?;
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let branch_id = self
+            .read_hash_field(&meta_key, "branch_id")
+            .await?
+            .unwrap_or_else(|| "br_main".to_owned());
+        let artifact_type = self
+            .read_hash_field(&meta_key, "artifact_type")
+            .await?
+            .unwrap_or_else(|| "code".to_owned());
+        let created_at = self
+            .read_hash_field(&meta_key, "created_at")
+            .await?
+            .unwrap_or_else(|| "0".to_owned())
+            .parse::<u64>()
+            .unwrap_or(0);
+        let current_version = self
+            .read_hash_field(&meta_key, "current_version")
+            .await?
+            .unwrap_or_else(|| "0".to_owned())
+            .parse::<u64>()
+            .unwrap_or(0);
+        let versions_key = self
+            .keyspace
+            .artifact_versions(artifact_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let mut conn = self.redis.clone();
+        let version_ids: Vec<String> = redis::cmd("ZRANGE")
+            .arg(versions_key)
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to load artifact versions '{}'", artifact_id))?;
+        let mut versions = Vec::with_capacity(version_ids.len());
+        for version_id in version_ids {
+            let version = version_id.parse::<u64>().unwrap_or(0);
+            let content_key = self
+                .keyspace
+                .artifact_version_content(artifact_id, &version_id)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            let content: Option<String> = redis::cmd("GET")
+                .arg(content_key)
+                .query_async(&mut conn)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to load artifact content '{}' version {}",
+                        artifact_id, version
+                    )
+                })?;
+            if let Some(content) = content {
+                versions.push(PersistedArtifactVersion { version, content });
+            }
+        }
+        Ok(Some(PersistedArtifactRecord {
+            artifact_id: artifact_id.to_owned(),
+            session_id,
+            branch_id,
+            artifact_type,
+            created_at,
+            current_version,
+            versions,
+        }))
+    }
+
+    pub async fn list_session_artifacts(&self, session_id: &str) -> Result<Vec<String>> {
+        let key = self
+            .keyspace
+            .session_artifacts(session_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let mut conn = self.redis.clone();
+        let mut artifact_ids: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to load session artifacts '{}'", session_id))?;
+        artifact_ids.sort();
+        Ok(artifact_ids)
     }
 
     pub async fn enqueue_workflow_job(&self, job: &DurableWorkflowJob) -> Result<()> {

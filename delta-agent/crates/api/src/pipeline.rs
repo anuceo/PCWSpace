@@ -14,7 +14,11 @@ use deltashot::{
 };
 use futures_util::StreamExt;
 use replay::{
-    adapters::{DurableNotionSyncJob, DurableWorkflowJob, RedisVddabRepository},
+    adapters::{
+        DurableNotionSyncJob, DurableWorkflowJob, PersistedArtifactRecord,
+        PersistedArtifactVersion, PersistedSessionMeta, PersistedWorkflowRecord,
+        PersistedWorkspaceRecord, RedisVddabRepository,
+    },
     verifier::{audit_replay, verify_chain, ReplayAuditResult, VerificationResult},
     verifier::{DeltaRepository, StateRepository},
 };
@@ -801,7 +805,9 @@ impl ExecutionPipeline {
         };
 
         let mut workspaces = self.workspaces.write().await;
-        workspaces.insert(workspace_id.clone(), record);
+        workspaces.insert(workspace_id.clone(), record.clone());
+        drop(workspaces);
+        self.persist_workspace_record(&record).await;
 
         Ok(WorkspaceCreateResponse {
             workspace_id,
@@ -889,7 +895,7 @@ impl ExecutionPipeline {
 
         {
             let mut sessions = self.sessions.write().await;
-            sessions.insert(session_id.clone(), record);
+            sessions.insert(session_id.clone(), record.clone());
         }
 
         {
@@ -900,12 +906,21 @@ impl ExecutionPipeline {
                 .push((created_at, session_id.clone()));
         }
 
-        {
+        let workspace_after_session_link = {
             let mut workspaces = self.workspaces.write().await;
             if let Some(ws) = workspaces.get_mut(&request.workspace_id) {
                 ws.active_session_id = Some(session_id.clone());
+                Some(ws.clone())
+            } else {
+                None
             }
+        };
+        if let Some(workspace) = workspace_after_session_link.as_ref() {
+            self.persist_workspace_record(workspace).await;
         }
+        self.persist_workspace_session_link(&request.workspace_id, &session_id, created_at)
+            .await;
+        self.persist_session_meta_record(&record).await;
         self.persist_active_branch_pointer(&session_id, MAIN_BRANCH_ID)
             .await;
         if let Some(repo) = self.persistence_backend().await {
@@ -1471,6 +1486,7 @@ impl ExecutionPipeline {
             let mut workflows = self.workflows.write().await;
             workflows.insert(request.workflow_id.clone(), record.clone());
         }
+        self.persist_workflow_record(&record).await;
 
         self.enqueue_workflow(
             &request.workflow_id,
@@ -1507,15 +1523,16 @@ impl ExecutionPipeline {
         request: WorkflowStepRequest,
     ) -> Result<WorkflowStateView, PipelineError> {
         self.ensure_persistence_hydrated().await;
-        let session_id = {
+        let (session_id, workflow_snapshot) = {
             let mut workflows = self.workflows.write().await;
             let record = workflows.get_mut(workflow_id).ok_or_else(|| {
                 PipelineError::NotFound(format!("workflow '{}' not found", workflow_id))
             })?;
             record.current_step = request.step.clone();
             record.updated_at = now_ms();
-            record.session_id.clone()
+            (record.session_id.clone(), record.clone())
         };
+        self.persist_workflow_record(&workflow_snapshot).await;
 
         self.enqueue_workflow(workflow_id, &session_id, &request.step, request.payload)
             .await;
@@ -1774,6 +1791,7 @@ impl ExecutionPipeline {
         let mut max_id = self.id_counter.load(Ordering::Relaxed);
         let mut recovered_deltashots = HashMap::<String, DeltashotRecord>::new();
         let mut recovered_sessions = HashMap::<String, SessionRecord>::new();
+        let mut recovered_artifacts = HashMap::<String, ArtifactRecord>::new();
 
         for session_id in session_ids {
             update_max_id_seed(&mut max_id, &session_id);
@@ -1810,6 +1828,13 @@ impl ExecutionPipeline {
             );
             session.branches.clear();
             session.active_branch_id = active_branch_id.clone();
+            if let Ok(Some(meta)) = repo.get_session_meta(&session_id).await {
+                session._workspace_id = meta.workspace_id;
+                session._name = meta.name;
+                session.created_at = meta.created_at;
+                session.status = meta.status;
+                session.workflow_id = meta.workflow_id;
+            }
 
             for branch_id in branch_ids {
                 update_max_id_seed(&mut max_id, &branch_id);
@@ -1886,7 +1911,95 @@ impl ExecutionPipeline {
                 session.active_branch_id = MAIN_BRANCH_ID.to_owned();
                 let _ = load_branch_into_session(&mut session, MAIN_BRANCH_ID);
             }
+            if let Ok(artifact_ids) = repo.list_session_artifacts(&session_id).await {
+                for artifact_id in artifact_ids {
+                    update_max_id_seed(&mut max_id, &artifact_id);
+                    if let Ok(Some(record)) = repo.get_artifact(&artifact_id).await {
+                        let versions = record
+                            .versions
+                            .into_iter()
+                            .map(|version| (version.version, version.content))
+                            .collect::<BTreeMap<_, _>>();
+                        recovered_artifacts.insert(
+                            artifact_id.clone(),
+                            ArtifactRecord {
+                                artifact_id: record.artifact_id.clone(),
+                                session_id: record.session_id.clone(),
+                                branch_id: record.branch_id,
+                                artifact_type: record.artifact_type,
+                                created_at: record.created_at,
+                                current_version: record.current_version,
+                                versions,
+                            },
+                        );
+                        session.artifacts.insert(artifact_id.clone());
+                    }
+                }
+            }
             recovered_sessions.insert(session_id, session);
+        }
+
+        let mut recovered_workspaces = HashMap::<String, WorkspaceRecord>::new();
+        let mut recovered_workspace_sessions = HashMap::<String, Vec<(u64, String)>>::new();
+        if let Ok(workspaces) = repo.list_workspaces().await {
+            for workspace in workspaces {
+                update_max_id_seed(&mut max_id, &workspace.workspace_id);
+                let workspace_id = workspace.workspace_id.clone();
+                recovered_workspaces.insert(
+                    workspace_id.clone(),
+                    WorkspaceRecord {
+                        workspace_id: workspace.workspace_id,
+                        name: workspace.name,
+                        created_at: workspace.created_at,
+                        owner_id: workspace.owner_id,
+                        active_session_id: workspace.active_session_id,
+                    },
+                );
+                if let Ok(links) = repo.get_workspace_sessions(&workspace_id).await {
+                    recovered_workspace_sessions.insert(workspace_id, links);
+                }
+            }
+        }
+        for session in recovered_sessions.values() {
+            let workspace_id = session._workspace_id.clone();
+            if workspace_id.is_empty() {
+                continue;
+            }
+            recovered_workspaces
+                .entry(workspace_id.clone())
+                .or_insert_with(|| WorkspaceRecord {
+                    workspace_id: workspace_id.clone(),
+                    name: "Rehydrated Workspace".to_owned(),
+                    created_at: session.created_at,
+                    owner_id: "system".to_owned(),
+                    active_session_id: Some(session.session_id.clone()),
+                });
+            recovered_workspace_sessions
+                .entry(workspace_id)
+                .or_default()
+                .push((session.created_at, session.session_id.clone()));
+        }
+
+        let mut recovered_workflows = HashMap::<String, WorkflowRecord>::new();
+        if let Ok(workflow_ids) = repo.list_workflow_ids().await {
+            for workflow_id in workflow_ids {
+                if let Ok(Some(workflow)) = repo.get_workflow_state(&workflow_id).await {
+                    recovered_workflows.insert(
+                        workflow_id.clone(),
+                        WorkflowRecord {
+                            workflow_id,
+                            session_id: workflow.session_id,
+                            status: workflow.status,
+                            current_step: workflow.current_step,
+                            updated_at: workflow.updated_at,
+                        },
+                    );
+                }
+            }
+        }
+        for entries in recovered_workspace_sessions.values_mut() {
+            entries.sort_by_key(|(ts, session_id)| (*ts, session_id.clone()));
+            entries.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
         }
 
         {
@@ -1899,6 +2012,30 @@ impl ExecutionPipeline {
             let mut deltas = self.deltashots.write().await;
             for (id, record) in recovered_deltashots {
                 deltas.entry(id).or_insert(record);
+            }
+        }
+        {
+            let mut artifacts = self.artifacts.write().await;
+            for (artifact_id, record) in recovered_artifacts {
+                artifacts.entry(artifact_id).or_insert(record);
+            }
+        }
+        {
+            let mut workflows = self.workflows.write().await;
+            for (workflow_id, record) in recovered_workflows {
+                workflows.entry(workflow_id).or_insert(record);
+            }
+        }
+        {
+            let mut workspaces = self.workspaces.write().await;
+            for (workspace_id, record) in recovered_workspaces {
+                workspaces.entry(workspace_id).or_insert(record);
+            }
+        }
+        {
+            let mut links = self.workspace_sessions.write().await;
+            for (workspace_id, entries) in recovered_workspace_sessions {
+                links.entry(workspace_id).or_insert(entries);
             }
         }
         seed_counter(&self.id_counter, max_id.saturating_add(1));
@@ -2011,6 +2148,113 @@ impl ExecutionPipeline {
                         "failed to persist snapshot after deltashot"
                     );
                 }
+            }
+        }
+    }
+
+    async fn persist_workspace_record(&self, workspace: &WorkspaceRecord) {
+        if let Some(repo) = self.persistence_backend().await {
+            let persisted = PersistedWorkspaceRecord {
+                workspace_id: workspace.workspace_id.clone(),
+                name: workspace.name.clone(),
+                created_at: workspace.created_at,
+                owner_id: workspace.owner_id.clone(),
+                active_session_id: workspace.active_session_id.clone(),
+            };
+            if let Err(err) = repo.store_workspace(&persisted).await {
+                warn!(
+                    workspace_id = %workspace.workspace_id,
+                    error = %err,
+                    "failed to persist workspace record"
+                );
+            }
+        }
+    }
+
+    async fn persist_workspace_session_link(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        created_at: u64,
+    ) {
+        if let Some(repo) = self.persistence_backend().await {
+            if let Err(err) = repo
+                .link_workspace_session(workspace_id, session_id, created_at)
+                .await
+            {
+                warn!(
+                    workspace_id = %workspace_id,
+                    session_id = %session_id,
+                    error = %err,
+                    "failed to persist workspace/session link"
+                );
+            }
+        }
+    }
+
+    async fn persist_session_meta_record(&self, session: &SessionRecord) {
+        if let Some(repo) = self.persistence_backend().await {
+            let persisted = PersistedSessionMeta {
+                session_id: session.session_id.clone(),
+                workspace_id: session._workspace_id.clone(),
+                name: session._name.clone(),
+                created_at: session.created_at,
+                status: session.status.clone(),
+                workflow_id: session.workflow_id.clone(),
+            };
+            if let Err(err) = repo.store_session_meta(&persisted).await {
+                warn!(
+                    session_id = %session.session_id,
+                    error = %err,
+                    "failed to persist session metadata"
+                );
+            }
+        }
+    }
+
+    async fn persist_workflow_record(&self, workflow: &WorkflowRecord) {
+        if let Some(repo) = self.persistence_backend().await {
+            let persisted = PersistedWorkflowRecord {
+                workflow_id: workflow.workflow_id.clone(),
+                session_id: workflow.session_id.clone(),
+                status: workflow.status.clone(),
+                current_step: workflow.current_step.clone(),
+                updated_at: workflow.updated_at,
+            };
+            if let Err(err) = repo.store_workflow_state(&persisted).await {
+                warn!(
+                    workflow_id = %workflow.workflow_id,
+                    error = %err,
+                    "failed to persist workflow state"
+                );
+            }
+        }
+    }
+
+    async fn persist_artifact_record(&self, artifact: &ArtifactRecord) {
+        if let Some(repo) = self.persistence_backend().await {
+            let persisted = PersistedArtifactRecord {
+                artifact_id: artifact.artifact_id.clone(),
+                session_id: artifact.session_id.clone(),
+                branch_id: artifact.branch_id.clone(),
+                artifact_type: artifact.artifact_type.clone(),
+                created_at: artifact.created_at,
+                current_version: artifact.current_version,
+                versions: artifact
+                    .versions
+                    .iter()
+                    .map(|(version, content)| PersistedArtifactVersion {
+                        version: *version,
+                        content: content.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            };
+            if let Err(err) = repo.store_artifact(&persisted).await {
+                warn!(
+                    artifact_id = %artifact.artifact_id,
+                    error = %err,
+                    "failed to persist artifact record"
+                );
             }
         }
     }
@@ -2918,6 +3162,7 @@ impl ExecutionPipeline {
                 (new_id, artifact_type.to_owned(), 1, None)
             }
         };
+        let artifact_snapshot = artifacts.get(&artifact_id).cloned();
         drop(artifacts);
 
         {
@@ -2935,6 +3180,9 @@ impl ExecutionPipeline {
             }
             session.artifacts.insert(artifact_id.clone());
             sync_active_branch_from_session(session);
+        }
+        if let Some(record) = artifact_snapshot.as_ref() {
+            self.persist_artifact_record(record).await;
         }
 
         Ok(ArtifactWriteOutcome {
@@ -2992,19 +3240,19 @@ impl ExecutionPipeline {
             queue.push(job);
         }
 
-        {
+        let workflow_record = {
             let mut workflows = self.workflows.write().await;
-            workflows.insert(
-                workflow_id.to_owned(),
-                WorkflowRecord {
-                    workflow_id: workflow_id.to_owned(),
-                    session_id: session_id.to_owned(),
-                    status: "active".to_owned(),
-                    current_step: step.to_owned(),
-                    updated_at: now,
-                },
-            );
-        }
+            let record = WorkflowRecord {
+                workflow_id: workflow_id.to_owned(),
+                session_id: session_id.to_owned(),
+                status: "active".to_owned(),
+                current_step: step.to_owned(),
+                updated_at: now,
+            };
+            workflows.insert(workflow_id.to_owned(), record.clone());
+            record
+        };
+        self.persist_workflow_record(&workflow_record).await;
     }
 
     async fn bind_session_workflow(&self, session_id: &str, workflow_id: &str) {
@@ -3017,6 +3265,9 @@ impl ExecutionPipeline {
             )
         });
         session.workflow_id = Some(workflow_id.to_owned());
+        let snapshot = session.clone();
+        drop(sessions);
+        self.persist_session_meta_record(&snapshot).await;
     }
 
     async fn next_workflow_job(&self) -> (Option<WorkflowJob>, WorkflowJobSource) {
