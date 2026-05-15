@@ -2043,6 +2043,7 @@ impl ExecutionPipeline {
         let hashchain_cutoff = source_idx
             .saturating_add(1)
             .min(source_branch.hashchain.len());
+        let inherited_deltashot_ids = source_branch.deltashot_ids[..=source_idx].to_vec();
         let parent_state = parent_snapshot.0;
         let parent_timestamp = parent_snapshot.1;
         let new_branch = BranchRecord {
@@ -2066,7 +2067,7 @@ impl ExecutionPipeline {
                 .cloned()
                 .collect::<Vec<_>>(),
             hashchain: source_branch.hashchain[..hashchain_cutoff].to_vec(),
-            deltashot_ids: source_branch.deltashot_ids[..=source_idx].to_vec(),
+            deltashot_ids: inherited_deltashot_ids.clone(),
             artifacts: branch_artifacts,
         };
 
@@ -2088,6 +2089,19 @@ impl ExecutionPipeline {
                     branch_id = %branch_id,
                     error = %err,
                     "failed to register created branch in persistence backend"
+                );
+            }
+            let storage_branch_id = persistence_branch_key(session_id, &branch_id);
+            if let Err(err) = repo
+                .replace_branch_chain(&storage_branch_id, &inherited_deltashot_ids)
+                .await
+            {
+                warn!(
+                    session_id = %session_id,
+                    branch_id = %branch_id,
+                    storage_branch_id = %storage_branch_id,
+                    error = %err,
+                    "failed to seed created branch chain in persistence backend"
                 );
             }
         }

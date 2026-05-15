@@ -157,7 +157,8 @@ pub async fn audit_replay(
     }
 
     let stored = state_repo.get_branch_state(branch_id).await?;
-    let final_state_match = state == stored;
+    let final_state_match =
+        normalize_state_for_compare(&state) == normalize_state_for_compare(&stored);
     if !final_state_match && start_index > 0 {
         warn!(
             branch_id = %branch_id,
@@ -185,7 +186,8 @@ pub async fn audit_replay(
             }
             full_last_hash = recomputed;
         }
-        let full_match = full_state == stored;
+        let full_match =
+            normalize_state_for_compare(&full_state) == normalize_state_for_compare(&stored);
         return Ok(ReplayAuditResult {
             valid: full_match,
             final_state_match: full_match,
@@ -198,6 +200,32 @@ pub async fn audit_replay(
         final_state_match,
         hash_match: true,
     })
+}
+
+fn normalize_state_for_compare(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let normalized = map
+                .iter()
+                .filter_map(|(key, child)| {
+                    let child = normalize_state_for_compare(child);
+                    if child.is_null() {
+                        None
+                    } else {
+                        Some((key.clone(), child))
+                    }
+                })
+                .collect::<serde_json::Map<String, Value>>();
+            Value::Object(normalized)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(normalize_state_for_compare)
+                .collect::<Vec<_>>(),
+        ),
+        other => other.clone(),
+    }
 }
 
 pub async fn full_audit(
