@@ -21,3 +21,4 @@ blake3.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 brotli.workspace = true
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "stream", "rustls"] }

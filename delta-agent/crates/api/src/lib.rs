@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod handlers;
 pub mod middleware;
 pub mod pipeline;

@@ -23,6 +23,8 @@ use thiserror::Error;
 use tokio::sync::{Mutex, OnceCell as TokioOnceCell, RwLock};
 use tracing::{info, warn};
 
+use crate::agents::config::AgentRuntimeConfig;
+
 const RECENT_MESSAGE_WINDOW: usize = 20;
 const SESSION_LOCK_TTL_SECS: u64 = 5;
 const SESSION_LOCK_RETRIES: usize = 3;
@@ -704,6 +706,7 @@ struct ArtifactWriteOutcome {
 
 #[derive(Debug)]
 pub struct ExecutionPipeline {
+    _agent_runtime_config: AgentRuntimeConfig,
     keyspace: RedisKeyspace,
     persistence: Option<PersistenceConfig>,
     id_counter: AtomicU64,
@@ -735,6 +738,7 @@ impl ExecutionPipeline {
             .map_err(|err| PipelineError::InvalidInput(format!("invalid key spec: {err}")))?;
 
         Ok(Self {
+            _agent_runtime_config: AgentRuntimeConfig::from_env(),
             keyspace,
             persistence: load_persistence_config(),
             id_counter: AtomicU64::new(1),
