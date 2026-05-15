@@ -24,6 +24,11 @@ use tokio::sync::{Mutex, OnceCell as TokioOnceCell, RwLock};
 use tracing::{info, warn};
 
 use crate::agents::config::AgentRuntimeConfig;
+use crate::agents::errors::AgentError;
+use crate::agents::router::RealAgentRouter;
+use crate::agents::types::{
+    AgentMessage as ClientAgentMessage, AgentMode as ClientAgentMode, AgentProvider, AgentRequest,
+};
 
 const RECENT_MESSAGE_WINDOW: usize = 20;
 const SESSION_LOCK_TTL_SECS: u64 = 5;
@@ -706,7 +711,7 @@ struct ArtifactWriteOutcome {
 
 #[derive(Debug)]
 pub struct ExecutionPipeline {
-    _agent_runtime_config: AgentRuntimeConfig,
+    agent_runtime_config: AgentRuntimeConfig,
     keyspace: RedisKeyspace,
     persistence: Option<PersistenceConfig>,
     id_counter: AtomicU64,
@@ -738,7 +743,7 @@ impl ExecutionPipeline {
             .map_err(|err| PipelineError::InvalidInput(format!("invalid key spec: {err}")))?;
 
         Ok(Self {
-            _agent_runtime_config: AgentRuntimeConfig::from_env(),
+            agent_runtime_config: AgentRuntimeConfig::from_env(),
             keyspace,
             persistence: load_persistence_config(),
             id_counter: AtomicU64::new(1),
@@ -993,7 +998,9 @@ impl ExecutionPipeline {
         )
         .await?;
 
-        let agent_output = run_agent(agent, &request.content, &context, &request.mode);
+        let agent_output = self
+            .resolve_agent_output(session_id, &request, &context, agent)
+            .await?;
         self.record_execution_step(session_id, "AGENT_EXECUTED", Value::Null)
             .await?;
 
@@ -2512,6 +2519,59 @@ impl ExecutionPipeline {
         Ok(())
     }
 
+    async fn resolve_agent_output(
+        &self,
+        session_id: &str,
+        request: &SendMessageRequestV1,
+        context: &SessionContext,
+        agent: AgentKind,
+    ) -> Result<AgentOutput, PipelineError> {
+        if !self.agent_runtime_config.use_real_agents {
+            return Ok(run_agent(agent, &request.content, context, &request.mode));
+        }
+
+        let agent_request = AgentRequest {
+            session_id: session_id.to_owned(),
+            request_id: format!("req_{}", uuid::Uuid::new_v4().simple()),
+            prompt: request.content.clone(),
+            context: context
+                .memory
+                .iter()
+                .rev()
+                .map(|message| ClientAgentMessage {
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                })
+                .collect::<Vec<_>>(),
+            metadata: request.metadata.clone(),
+            mode: map_message_mode(&request.mode),
+            model_override: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let provider = match agent {
+            AgentKind::Claude => AgentProvider::Claude,
+            AgentKind::DeepSeek => AgentProvider::DeepSeek,
+        };
+        let router =
+            RealAgentRouter::new(self.agent_runtime_config.clone()).map_err(map_agent_error)?;
+        let result = router
+            .complete(provider, agent_request)
+            .await
+            .map_err(map_agent_error)?;
+        info!(
+            session_id = %session_id,
+            provider = ?result.provider,
+            model = %result.model,
+            latency_ms = result.latency_ms,
+            "real agent completion executed"
+        );
+
+        let mut output = run_agent(agent, &request.content, context, &request.mode);
+        output.text = result.text;
+        Ok(output)
+    }
+
     async fn hydrate_context(&self, session_id: &str) -> SessionContext {
         let mut sessions = self.sessions.write().await;
         let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
@@ -2980,6 +3040,39 @@ fn normalize_agent_name(input: &str) -> Option<&'static str> {
         "claude" => Some("claude"),
         "deepseek" => Some("deepseek"),
         _ => None,
+    }
+}
+
+fn map_message_mode(mode: &MessageMode) -> ClientAgentMode {
+    match mode {
+        MessageMode::Chat => ClientAgentMode::Chat,
+        MessageMode::Workflow => ClientAgentMode::Workflow,
+        MessageMode::Execution => ClientAgentMode::Execution,
+    }
+}
+
+fn map_agent_error(error: AgentError) -> PipelineError {
+    match error {
+        AgentError::Configuration(message) => PipelineError::InvalidInput(message),
+        AgentError::ProviderUnavailable(message) => PipelineError::Internal(message),
+        AgentError::Timeout { stage } => {
+            PipelineError::Internal(format!("agent provider timeout during {stage}"))
+        }
+        AgentError::Transport(message) => PipelineError::Internal(message),
+        AgentError::HttpStatus { status, body } => {
+            PipelineError::Internal(format!("agent provider http status {status}: {body}"))
+        }
+        AgentError::RateLimited { retry_after_ms } => {
+            PipelineError::Internal(match retry_after_ms {
+                Some(ms) => format!("agent provider rate limited, retry after {ms}ms"),
+                None => "agent provider rate limited".to_owned(),
+            })
+        }
+        AgentError::Deserialize(message) => PipelineError::Internal(message),
+        AgentError::StreamTerminated => {
+            PipelineError::Internal("agent provider stream terminated".to_owned())
+        }
+        AgentError::NonRetryable(message) => PipelineError::Internal(message),
     }
 }
 
