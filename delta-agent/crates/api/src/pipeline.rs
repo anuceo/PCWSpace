@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use delta_core::redis_schema::{
@@ -14,7 +14,7 @@ use deltashot::{
 };
 use futures_util::StreamExt;
 use replay::{
-    adapters::RedisVddabRepository,
+    adapters::{DurableNotionSyncJob, DurableWorkflowJob, RedisVddabRepository},
     verifier::{audit_replay, verify_chain, ReplayAuditResult, VerificationResult},
     verifier::{DeltaRepository, StateRepository},
 };
@@ -335,6 +335,13 @@ pub struct WorkflowExecutionResult {
     pub step: String,
     pub deltashot_id: String,
     pub state_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NotionSyncExecutionResult {
+    pub session_id: String,
+    pub artifacts_count: usize,
+    pub summary_preview: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -662,6 +669,7 @@ struct WorkflowJob {
     step: String,
     payload: String,
     timestamp_ms: u64,
+    attempt: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -669,6 +677,14 @@ struct NotionSyncJob {
     session_id: String,
     summary: String,
     artifacts: Vec<String>,
+    timestamp_ms: u64,
+    attempt: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WorkflowJobSource {
+    Durable,
+    InMemory,
 }
 
 #[derive(Debug, Clone)]
@@ -724,7 +740,7 @@ pub struct ExecutionPipeline {
     workflows: RwLock<HashMap<String, WorkflowRecord>>,
     workflow_queue: Mutex<Vec<WorkflowJob>>,
     agent_logs: RwLock<HashMap<String, Vec<AgentLogEntry>>>,
-    notion_queue: Arc<Mutex<Vec<NotionSyncJob>>>,
+    notion_queue: Mutex<Vec<NotionSyncJob>>,
     locks: Mutex<HashMap<String, Instant>>,
     idempotent_streams: Mutex<HashMap<String, Vec<StreamEventEnvelope>>>,
     persistence_hydration: TokioOnceCell<()>,
@@ -756,7 +772,7 @@ impl ExecutionPipeline {
             workflows: RwLock::new(HashMap::new()),
             workflow_queue: Mutex::new(Vec::new()),
             agent_logs: RwLock::new(HashMap::new()),
-            notion_queue: Arc::new(Mutex::new(Vec::new())),
+            notion_queue: Mutex::new(Vec::new()),
             locks: Mutex::new(HashMap::new()),
             idempotent_streams: Mutex::new(HashMap::new()),
             persistence_hydration: TokioOnceCell::new(),
@@ -1516,14 +1532,7 @@ impl ExecutionPipeline {
         &self,
     ) -> Result<Option<WorkflowExecutionResult>, PipelineError> {
         self.ensure_persistence_hydrated().await;
-        let next_job = {
-            let mut queue = self.workflow_queue.lock().await;
-            if queue.is_empty() {
-                None
-            } else {
-                Some(queue.remove(0))
-            }
-        };
+        let (next_job, source) = self.next_workflow_job().await;
 
         let Some(job) = next_job else {
             return Ok(None);
@@ -1556,12 +1565,35 @@ impl ExecutionPipeline {
             })),
             Err(error) => {
                 if matches!(error, PipelineError::LockUnavailable) {
-                    let mut queue = self.workflow_queue.lock().await;
-                    queue.push(job);
+                    self.requeue_workflow_job(job, source).await;
                 }
                 Err(error)
             }
         }
+    }
+
+    pub async fn execute_next_notion_sync_job(
+        &self,
+    ) -> Result<Option<NotionSyncExecutionResult>, PipelineError> {
+        self.ensure_persistence_hydrated().await;
+        let (next_job, _source) = self.next_notion_sync_job().await;
+        let Some(job) = next_job else {
+            return Ok(None);
+        };
+
+        let preview = job.summary.chars().take(140).collect::<String>();
+        info!(
+            session_id = %job.session_id,
+            artifacts_count = job.artifacts.len(),
+            attempt = job.attempt,
+            "executed notion sync background job"
+        );
+
+        Ok(Some(NotionSyncExecutionResult {
+            session_id: job.session_id,
+            artifacts_count: job.artifacts.len(),
+            summary_preview: preview,
+        }))
     }
 
     pub async fn force_agent_selection(
@@ -2947,15 +2979,17 @@ impl ExecutionPipeline {
         payload: Value,
     ) {
         let now = now_ms();
-        {
+        let job = WorkflowJob {
+            workflow_id: workflow_id.to_owned(),
+            session_id: session_id.to_owned(),
+            step: step.to_owned(),
+            payload: payload.to_string(),
+            timestamp_ms: now,
+            attempt: 0,
+        };
+        if !self.enqueue_workflow_durable(&job).await {
             let mut queue = self.workflow_queue.lock().await;
-            queue.push(WorkflowJob {
-                workflow_id: workflow_id.to_owned(),
-                session_id: session_id.to_owned(),
-                step: step.to_owned(),
-                payload: payload.to_string(),
-                timestamp_ms: now,
-            });
+            queue.push(job);
         }
 
         {
@@ -2985,6 +3019,125 @@ impl ExecutionPipeline {
         session.workflow_id = Some(workflow_id.to_owned());
     }
 
+    async fn next_workflow_job(&self) -> (Option<WorkflowJob>, WorkflowJobSource) {
+        if let Some(repo) = self.persistence_backend().await {
+            match repo.dequeue_workflow_job().await {
+                Ok(Some(job)) => {
+                    return (
+                        Some(WorkflowJob {
+                            workflow_id: job.workflow_id,
+                            session_id: job.session_id,
+                            step: job.step,
+                            payload: job.payload,
+                            timestamp_ms: job.timestamp_ms,
+                            attempt: job.attempt,
+                        }),
+                        WorkflowJobSource::Durable,
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(error = %err, "failed to dequeue durable workflow job");
+                }
+            }
+        }
+
+        let mut queue = self.workflow_queue.lock().await;
+        let next = if queue.is_empty() {
+            None
+        } else {
+            Some(queue.remove(0))
+        };
+        (next, WorkflowJobSource::InMemory)
+    }
+
+    async fn requeue_workflow_job(&self, mut job: WorkflowJob, source: WorkflowJobSource) {
+        job.attempt = job.attempt.saturating_add(1);
+        if matches!(source, WorkflowJobSource::Durable) {
+            if self.enqueue_workflow_durable(&job).await {
+                return;
+            }
+            warn!(
+                workflow_id = %job.workflow_id,
+                session_id = %job.session_id,
+                "durable workflow requeue failed, falling back to in-memory queue"
+            );
+        }
+        let mut queue = self.workflow_queue.lock().await;
+        queue.push(job);
+    }
+
+    async fn enqueue_workflow_durable(&self, job: &WorkflowJob) -> bool {
+        let Some(repo) = self.persistence_backend().await else {
+            return false;
+        };
+        let durable = DurableWorkflowJob {
+            workflow_id: job.workflow_id.clone(),
+            session_id: job.session_id.clone(),
+            step: job.step.clone(),
+            payload: job.payload.clone(),
+            timestamp_ms: job.timestamp_ms,
+            attempt: job.attempt,
+        };
+        match repo.enqueue_workflow_job(&durable).await {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(error = %err, "failed to enqueue workflow job durably");
+                false
+            }
+        }
+    }
+
+    async fn next_notion_sync_job(&self) -> (Option<NotionSyncJob>, WorkflowJobSource) {
+        if let Some(repo) = self.persistence_backend().await {
+            match repo.dequeue_notion_sync_job().await {
+                Ok(Some(job)) => {
+                    return (
+                        Some(NotionSyncJob {
+                            session_id: job.session_id,
+                            summary: job.summary,
+                            artifacts: job.artifacts,
+                            timestamp_ms: job.timestamp_ms,
+                            attempt: job.attempt,
+                        }),
+                        WorkflowJobSource::Durable,
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(error = %err, "failed to dequeue durable notion sync job");
+                }
+            }
+        }
+        let mut queue = self.notion_queue.lock().await;
+        let next = if queue.is_empty() {
+            None
+        } else {
+            Some(queue.remove(0))
+        };
+        (next, WorkflowJobSource::InMemory)
+    }
+
+    async fn enqueue_notion_sync_durable(&self, job: &NotionSyncJob) -> bool {
+        let Some(repo) = self.persistence_backend().await else {
+            return false;
+        };
+        let durable = DurableNotionSyncJob {
+            session_id: job.session_id.clone(),
+            summary: job.summary.clone(),
+            artifacts: job.artifacts.clone(),
+            timestamp_ms: job.timestamp_ms,
+            attempt: job.attempt,
+        };
+        match repo.enqueue_notion_sync_job(&durable).await {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(error = %err, "failed to enqueue notion sync job durably");
+                false
+            }
+        }
+    }
+
     async fn append_agent_log(&self, session_id: &str, agent: &AgentKind, reason: &str) {
         let entry = AgentLogEntry {
             ts: now_ms(),
@@ -3006,6 +3159,7 @@ impl ExecutionPipeline {
         summary: &str,
         artifacts: &[ArtifactEnvelope],
     ) {
+        let now = now_ms();
         let job = NotionSyncJob {
             session_id: session_id.to_owned(),
             summary: summary.to_owned(),
@@ -3013,21 +3167,16 @@ impl ExecutionPipeline {
                 .iter()
                 .map(|artifact| artifact.artifact_id.clone())
                 .collect::<Vec<_>>(),
+            timestamp_ms: now,
+            attempt: 0,
         };
-
-        let queue = Arc::clone(&self.notion_queue);
-        let session_id = session_id.to_owned();
-        tokio::spawn(async move {
-            let mut q = queue.lock().await;
-            info!(
-                session_id = %job.session_id,
-                summary = %job.summary,
-                artifacts_count = job.artifacts.len(),
-                "notion sync job recorded"
-            );
-            q.push(job);
-            info!(session_id = %session_id, "notion sync enqueued");
-        });
+        if self.enqueue_notion_sync_durable(&job).await {
+            info!(session_id = %session_id, "notion sync durably enqueued");
+            return;
+        }
+        let mut queue = self.notion_queue.lock().await;
+        queue.push(job);
+        info!(session_id = %session_id, "notion sync enqueued in-memory");
     }
 
     async fn record_execution_step(

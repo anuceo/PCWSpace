@@ -75,6 +75,12 @@ Overrides:
 
 - `DELTA_AGENT_CONFIG` (default: `configs/default.toml`)
 - `RUST_LOG` (default: `worker=info`)
+- `DELTA_AGENT_REDIS_URL` + `DELTA_AGENT_VDDAB_ROOT` enable durable background queues
+
+Worker background execution endpoints:
+
+- `POST /api/v1/workflows/execute-next`
+- `POST /api/v1/workflows/notion/execute-next`
 
 ## API v1 Contract
 

@@ -8,6 +8,10 @@ use serde::Deserialize;
 pub struct WorkerConfig {
     pub max_concurrency: usize,
     pub poll_interval_ms: u64,
+    #[serde(default = "default_api_base_url")]
+    pub api_base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -22,4 +26,8 @@ pub fn load(path: impl AsRef<Path>) -> anyhow::Result<WorkerConfig> {
     let parsed: RootConfig = toml::from_str(&raw)
         .with_context(|| format!("failed to parse TOML config {}", path_ref.display()))?;
     Ok(parsed.worker)
+}
+
+fn default_api_base_url() -> String {
+    "http://127.0.0.1:8080".to_owned()
 }

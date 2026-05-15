@@ -154,6 +154,13 @@ const KEY_SPECS: &[KeySpec] = &[
         notes: "Workflow queue stream",
     },
     KeySpec {
+        key_name: "notion_sync_queue",
+        template: "{env}:queue:notion_sync",
+        primitive: RedisPrimitive::Stream,
+        retention: RetentionClass::Persistent,
+        notes: "Notion sync queue stream",
+    },
+    KeySpec {
         key_name: "agent_queue",
         template: "{env}:queue:agent",
         primitive: RedisPrimitive::Stream,
@@ -557,6 +564,10 @@ impl RedisKeyspace {
         self.compose(&["queue", "workflow"])
     }
 
+    pub fn notion_sync_queue(&self) -> String {
+        self.compose(&["queue", "notion_sync"])
+    }
+
     pub fn agent_queue(&self) -> String {
         self.compose(&["queue", "agent"])
     }
@@ -806,6 +817,9 @@ mod tests {
         assert!(key_specs()
             .iter()
             .any(|spec| spec.key_name == "queue_branch_priority"));
+        assert!(key_specs()
+            .iter()
+            .any(|spec| spec.key_name == "notion_sync_queue"));
         assert!(key_specs()
             .iter()
             .any(|spec| spec.key_name == "session_active_branch"));

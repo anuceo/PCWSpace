@@ -2490,8 +2490,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "replay",
+ "reqwest",
  "scheduler",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",

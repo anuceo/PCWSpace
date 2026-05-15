@@ -5,6 +5,8 @@ port = 8080
 [worker]
 max_concurrency = 8
 poll_interval_ms = 100
+api_base_url = "http://127.0.0.1:8080"
+# api_key = "set-via-env-or-config"
 
 [storage]
 root = "./data"

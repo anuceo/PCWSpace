@@ -5,6 +5,8 @@ use anyhow::{anyhow, Context, Result};
 use delta_core::redis_schema::RedisKeyspace;
 use deltashot::{DeltaShot, Metadata, Op};
 use redis::aio::ConnectionManager;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vddab::{deltashot_store::DeltaShotStore, snapshot_store::SnapshotStore};
 
@@ -16,6 +18,25 @@ pub struct RedisVddabRepository {
     keyspace: RedisKeyspace,
     deltashot_store: DeltaShotStore,
     snapshot_store: SnapshotStore,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurableWorkflowJob {
+    pub workflow_id: String,
+    pub session_id: String,
+    pub step: String,
+    pub payload: String,
+    pub timestamp_ms: u64,
+    pub attempt: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurableNotionSyncJob {
+    pub session_id: String,
+    pub summary: String,
+    pub artifacts: Vec<String>,
+    pub timestamp_ms: u64,
+    pub attempt: u32,
 }
 
 impl RedisVddabRepository {
@@ -467,6 +488,71 @@ impl RedisVddabRepository {
                 )
             })?;
         Ok(active)
+    }
+
+    pub async fn enqueue_workflow_job(&self, job: &DurableWorkflowJob) -> Result<()> {
+        let key = self.keyspace.workflow_queue();
+        self.enqueue_stream_payload(&key, job).await
+    }
+
+    pub async fn dequeue_workflow_job(&self) -> Result<Option<DurableWorkflowJob>> {
+        let key = self.keyspace.workflow_queue();
+        self.dequeue_stream_payload(&key).await
+    }
+
+    pub async fn enqueue_notion_sync_job(&self, job: &DurableNotionSyncJob) -> Result<()> {
+        let key = self.keyspace.notion_sync_queue();
+        self.enqueue_stream_payload(&key, job).await
+    }
+
+    pub async fn dequeue_notion_sync_job(&self) -> Result<Option<DurableNotionSyncJob>> {
+        let key = self.keyspace.notion_sync_queue();
+        self.dequeue_stream_payload(&key).await
+    }
+
+    async fn enqueue_stream_payload<T: Serialize>(&self, key: &str, payload: &T) -> Result<()> {
+        let data = serde_json::to_string(payload).context("failed to serialize queue payload")?;
+        let mut conn = self.redis.clone();
+        let _: String = redis::cmd("XADD")
+            .arg(key)
+            .arg("*")
+            .arg("payload")
+            .arg(data)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to append stream payload for key '{}'", key))?;
+        Ok(())
+    }
+
+    async fn dequeue_stream_payload<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let mut conn = self.redis.clone();
+        let range: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+            .arg(key)
+            .arg("-")
+            .arg("+")
+            .arg("COUNT")
+            .arg(1)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to read stream payload for key '{}'", key))?;
+
+        let Some(entry) = range.ids.into_iter().next() else {
+            return Ok(None);
+        };
+        let payload = entry
+            .map
+            .get("payload")
+            .and_then(|value| redis::from_redis_value::<String>(value).ok())
+            .ok_or_else(|| anyhow!("stream entry {} missing payload field", entry.id))?;
+        let decoded = serde_json::from_str::<T>(&payload)
+            .with_context(|| format!("invalid stream payload in key '{}'", key))?;
+        let _: i64 = redis::cmd("XDEL")
+            .arg(key)
+            .arg(&entry.id)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to ack stream payload for key '{}'", key))?;
+        Ok(Some(decoded))
     }
 }
 

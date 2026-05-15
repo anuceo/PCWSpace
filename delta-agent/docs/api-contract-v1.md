@@ -258,6 +258,7 @@ Artifact write request:
 
 - `POST /workflows/start`
 - `POST /workflows/execute-next`
+- `POST /workflows/notion/execute-next`
 - `GET /workflows/{workflowId}/state`
 - `POST /workflows/{workflowId}/step`
 
@@ -269,6 +270,40 @@ Workflow start request:
   "workflow_id": "client_outreach",
   "input": {
     "target": "SaaS founders"
+  }
+}
+```
+
+Background worker pull response (`POST /workflows/execute-next`):
+
+```json
+{
+  "executed": true,
+  "result": {
+    "workflow_id": "client_outreach",
+    "session_id": "sess_456",
+    "step": "start",
+    "deltashot_id": "ds_120",
+    "state_version": 21
+  },
+  "meta": {
+    "request_id": "req_123",
+    "timestamp": 1775453669005,
+    "latency_ms": 12
+  }
+}
+```
+
+If no job is available:
+
+```json
+{
+  "executed": false,
+  "result": null,
+  "meta": {
+    "request_id": "req_123",
+    "timestamp": 1775453669005,
+    "latency_ms": 1
   }
 }
 ```

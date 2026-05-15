@@ -20,8 +20,9 @@ use crate::pipeline::{
     BranchAuditResponse, BranchCreateRequest, BranchListResponse, BranchMergeRequest,
     BranchMergeResponse, BranchSwitchRequest, BranchSwitchResponse, CreateSessionRequest,
     CreateWorkspaceRequest, DeltashotView, ExecutionTrace, ForceAgentRequest, MessageRecord,
-    PipelineError, PipelineState, RollbackRequest, SendMessageRequestV1, SessionView,
-    StreamMessageRequestV1, WorkflowStartRequest, WorkflowStepRequest,
+    NotionSyncExecutionResult, PipelineError, PipelineState, RollbackRequest, SendMessageRequestV1,
+    SessionView, StreamMessageRequestV1, WorkflowExecutionResult, WorkflowStartRequest,
+    WorkflowStepRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +35,18 @@ struct WorkspaceSessionQuery {
 struct SessionMessagesQuery {
     limit: Option<usize>,
     cursor: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ExecuteNextWorkflowEnvelope {
+    executed: bool,
+    result: Option<WorkflowExecutionResult>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ExecuteNextNotionEnvelope {
+    executed: bool,
+    result: Option<NotionSyncExecutionResult>,
 }
 
 pub fn router() -> Router<Arc<PipelineState>> {
@@ -65,6 +78,10 @@ pub fn router() -> Router<Arc<PipelineState>> {
         )
         .route("/workflows/start", post(start_workflow))
         .route("/workflows/execute-next", post(execute_next_workflow_job))
+        .route(
+            "/workflows/notion/execute-next",
+            post(execute_next_notion_job),
+        )
         .route("/workflows/{workflowId}/state", get(get_workflow_state))
         .route("/workflows/{workflowId}/step", post(advance_workflow_step))
         .route("/sessions/{sessionId}/agent", post(force_agent_selection))
@@ -264,8 +281,21 @@ async fn start_workflow(
 
 async fn execute_next_workflow_job(State(state): State<Arc<PipelineState>>) -> impl IntoResponse {
     with_meta(async move {
-        state.execute_next_workflow_job().await?.ok_or_else(|| {
-            PipelineError::NotFound("no workflow job available for execution".to_owned())
+        let result = state.execute_next_workflow_job().await?;
+        Ok::<ExecuteNextWorkflowEnvelope, PipelineError>(ExecuteNextWorkflowEnvelope {
+            executed: result.is_some(),
+            result,
+        })
+    })
+    .await
+}
+
+async fn execute_next_notion_job(State(state): State<Arc<PipelineState>>) -> impl IntoResponse {
+    with_meta(async move {
+        let result = state.execute_next_notion_sync_job().await?;
+        Ok::<ExecuteNextNotionEnvelope, PipelineError>(ExecuteNextNotionEnvelope {
+            executed: result.is_some(),
+            result,
         })
     })
     .await
