@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
@@ -138,21 +139,27 @@ impl RedisVddabRepository {
             .deltashot_object(deltashot_id)
             .map_err(|err| anyhow!(err.to_string()))?;
         let branch_id = self
-            .read_hash_field(&object_key, "branch_id")
+            .read_hash_field(&object_key, "storage_branch_id")
             .await?
+            .or(self.read_hash_field(&object_key, "branch_id").await?)
             .ok_or_else(|| anyhow!("missing branch_id for deltashot {}", deltashot_id))?;
         Ok(self
             .deltashot_store
             .absolute_ops_path(&branch_id, deltashot_id))
     }
 
-    pub async fn store_deltashot(&self, delta: &DeltaShot, compressed_ops: &[u8]) -> Result<()> {
+    pub async fn store_deltashot(
+        &self,
+        delta: &DeltaShot,
+        storage_branch_id: &str,
+        compressed_ops: &[u8],
+    ) -> Result<()> {
         let ops_path = self
             .deltashot_store
-            .write_compressed_ops(&delta.branch_id, &delta.id, compressed_ops)
+            .write_compressed_ops(storage_branch_id, &delta.id, compressed_ops)
             .await
             .with_context(|| format!("failed to write ops for deltashot '{}'", delta.id))?;
-        let rel_path = DeltaShotStore::relative_ops_path(&delta.branch_id, &delta.id);
+        let rel_path = DeltaShotStore::relative_ops_path(storage_branch_id, &delta.id);
         let rel_path = rel_path.to_string_lossy().to_string();
         let payload =
             serde_json::to_string(delta).with_context(|| format!("serialize '{}'", delta.id))?;
@@ -171,7 +178,7 @@ impl RedisVddabRepository {
             .map_err(|err| anyhow!(err.to_string()))?;
         let branch_key = self
             .keyspace
-            .branch_deltashots(&delta.branch_id)
+            .branch_deltashots(storage_branch_id)
             .map_err(|err| anyhow!(err.to_string()))?;
         let session_key = self
             .keyspace
@@ -179,16 +186,20 @@ impl RedisVddabRepository {
             .map_err(|err| anyhow!(err.to_string()))?;
         let active_ds_key = self
             .keyspace
-            .branch_active_deltashot(&delta.branch_id)
+            .branch_active_deltashot(storage_branch_id)
             .map_err(|err| anyhow!(err.to_string()))?;
 
         let mut conn = self.redis.clone();
-        let _: () = redis::cmd("HSET")
+        let mut tx = redis::pipe();
+        tx.atomic()
+            .cmd("HSET")
             .arg(&delta_key)
             .arg("session_id")
             .arg(&delta.session_id)
             .arg("branch_id")
             .arg(&delta.branch_id)
+            .arg("storage_branch_id")
+            .arg(storage_branch_id)
             .arg("prev_hash")
             .arg(&delta.prev_hash)
             .arg("hash")
@@ -203,28 +214,8 @@ impl RedisVddabRepository {
             .arg(&artifacts_json)
             .arg("payload")
             .arg(&payload)
-            .query_async(&mut conn)
-            .await
-            .with_context(|| format!("failed to write deltashot object '{}'", delta.id))?;
-        if let Some(agent) = delta.metadata.agent.as_ref() {
-            let _: () = redis::cmd("HSET")
-                .arg(&delta_key)
-                .arg("agent")
-                .arg(agent)
-                .query_async(&mut conn)
-                .await
-                .with_context(|| format!("failed to write agent metadata for '{}'", delta.id))?;
-        }
-        if let Some(workflow_step) = delta.metadata.workflow_step.as_ref() {
-            let _: () = redis::cmd("HSET")
-                .arg(&delta_key)
-                .arg("workflow_step")
-                .arg(workflow_step)
-                .query_async(&mut conn)
-                .await
-                .with_context(|| format!("failed to write workflow metadata for '{}'", delta.id))?;
-        }
-        let _: () = redis::cmd("HSET")
+            .ignore()
+            .cmd("HSET")
             .arg(&storage_key)
             .arg("backend")
             .arg("vddab")
@@ -234,31 +225,43 @@ impl RedisVddabRepository {
             .arg(ops_path.to_string_lossy().to_string())
             .arg("compressed_ops")
             .arg(compressed_ops)
-            .query_async(&mut conn)
-            .await
-            .with_context(|| format!("failed to write storage mapping for '{}'", delta.id))?;
-        let _: () = redis::cmd("ZADD")
+            .ignore()
+            .cmd("ZADD")
             .arg(&branch_key)
             .arg(delta.timestamp.to_string())
             .arg(&delta.id)
-            .query_async(&mut conn)
-            .await
-            .with_context(|| format!("failed to append branch chain for '{}'", delta.branch_id))?;
-        let _: () = redis::cmd("ZADD")
+            .ignore()
+            .cmd("ZADD")
             .arg(&session_key)
             .arg(delta.timestamp.to_string())
             .arg(&delta.id)
-            .query_async(&mut conn)
-            .await
-            .with_context(|| {
-                format!("failed to append session chain for '{}'", delta.session_id)
-            })?;
-        let _: () = redis::cmd("SET")
+            .ignore()
+            .cmd("SET")
             .arg(&active_ds_key)
             .arg(&delta.id)
+            .ignore();
+        if let Some(agent) = delta.metadata.agent.as_ref() {
+            tx.cmd("HSET")
+                .arg(&delta_key)
+                .arg("agent")
+                .arg(agent)
+                .ignore();
+        } else {
+            tx.cmd("HDEL").arg(&delta_key).arg("agent").ignore();
+        }
+        if let Some(workflow_step) = delta.metadata.workflow_step.as_ref() {
+            tx.cmd("HSET")
+                .arg(&delta_key)
+                .arg("workflow_step")
+                .arg(workflow_step)
+                .ignore();
+        } else {
+            tx.cmd("HDEL").arg(&delta_key).arg("workflow_step").ignore();
+        }
+        let _: () = tx
             .query_async(&mut conn)
             .await
-            .with_context(|| format!("failed to set active ds for '{}'", delta.branch_id))?;
+            .with_context(|| format!("failed to transactionally store deltashot '{}'", delta.id))?;
         Ok(())
     }
 
@@ -399,6 +402,71 @@ impl RedisVddabRepository {
                 )
             })?;
         Ok(())
+    }
+
+    pub async fn list_sessions(&self) -> Result<Vec<String>> {
+        let mut cursor = 0u64;
+        let pattern = format!("{}:session:*:branches", self.keyspace.env());
+        let mut sessions = HashSet::new();
+        let mut conn = self.redis.clone();
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(256)
+                .query_async(&mut conn)
+                .await
+                .context("failed to scan session branch keys")?;
+            for key in keys {
+                let parts = key.split(':').collect::<Vec<_>>();
+                if parts.len() >= 4 && parts[1] == "session" {
+                    sessions.insert(parts[2].to_owned());
+                }
+            }
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
+        }
+        let mut ordered = sessions.into_iter().collect::<Vec<_>>();
+        ordered.sort();
+        Ok(ordered)
+    }
+
+    pub async fn list_session_branches(&self, session_id: &str) -> Result<Vec<String>> {
+        let branches_key = self
+            .keyspace
+            .session_branches(session_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let mut conn = self.redis.clone();
+        let mut branches: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(branches_key)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to load branches for session '{}'", session_id))?;
+        branches.sort();
+        Ok(branches)
+    }
+
+    pub async fn get_session_active_branch(&self, session_id: &str) -> Result<Option<String>> {
+        let active_key = self
+            .keyspace
+            .session_active_branch(session_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let mut conn = self.redis.clone();
+        let active: Option<String> = redis::cmd("GET")
+            .arg(active_key)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load active branch pointer for session '{}'",
+                    session_id
+                )
+            })?;
+        Ok(active)
     }
 }
 

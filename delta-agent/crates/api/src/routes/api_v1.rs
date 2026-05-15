@@ -70,7 +70,10 @@ pub fn router() -> Router<Arc<PipelineState>> {
         .route("/sessions/{sessionId}/agent", post(force_agent_selection))
         .route("/sessions/{sessionId}/agents/logs", get(get_agent_logs))
         .route("/sessions/{sessionId}/trace", get(get_trace))
-        .route("/debug/branches/{branchId}/audit", post(run_branch_audit))
+        .route(
+            "/debug/sessions/{sessionId}/branches/{branchId}/audit",
+            post(run_branch_audit),
+        )
         .route("/sessions/{sessionId}/branch", post(create_branch))
         .route("/sessions/{sessionId}/branches", get(list_branches))
         .route("/sessions/{sessionId}/branch/switch", post(switch_branch))
@@ -320,11 +323,11 @@ async fn get_trace(
 }
 
 async fn run_branch_audit(
-    Path(branch_id): Path<String>,
+    Path((session_id, branch_id)): Path<(String, String)>,
     State(state): State<Arc<PipelineState>>,
 ) -> impl IntoResponse {
     with_meta(async move {
-        let report = state.debug_audit_branch(&branch_id).await?;
+        let report = state.debug_audit_branch(&session_id, &branch_id).await?;
         Ok::<BranchAuditResponse, PipelineError>(report)
     })
     .await

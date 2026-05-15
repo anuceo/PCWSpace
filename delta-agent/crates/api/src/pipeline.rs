@@ -15,11 +15,12 @@ use deltashot::{
 use replay::{
     adapters::RedisVddabRepository,
     verifier::{audit_replay, verify_chain, ReplayAuditResult, VerificationResult},
+    verifier::{DeltaRepository, StateRepository},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OnceCell as TokioOnceCell, RwLock};
 use tracing::{info, warn};
 
 const RECENT_MESSAGE_WINDOW: usize = 20;
@@ -717,6 +718,7 @@ pub struct ExecutionPipeline {
     notion_queue: Arc<Mutex<Vec<NotionSyncJob>>>,
     locks: Mutex<HashMap<String, Instant>>,
     idempotent_streams: Mutex<HashMap<String, Vec<StreamEventEnvelope>>>,
+    persistence_hydration: TokioOnceCell<()>,
 }
 
 pub type PipelineState = ExecutionPipeline;
@@ -747,6 +749,7 @@ impl ExecutionPipeline {
             notion_queue: Arc::new(Mutex::new(Vec::new())),
             locks: Mutex::new(HashMap::new()),
             idempotent_streams: Mutex::new(HashMap::new()),
+            persistence_hydration: TokioOnceCell::new(),
         })
     }
 
@@ -754,6 +757,7 @@ impl ExecutionPipeline {
         &self,
         request: CreateWorkspaceRequest,
     ) -> Result<WorkspaceCreateResponse, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         if request.name.trim().is_empty() {
             return Err(PipelineError::InvalidInput(
                 "workspace name cannot be empty".to_owned(),
@@ -832,6 +836,7 @@ impl ExecutionPipeline {
         &self,
         request: CreateSessionRequest,
     ) -> Result<SessionCreateResponse, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         if request.name.trim().is_empty() {
             return Err(PipelineError::InvalidInput(
                 "session name cannot be empty".to_owned(),
@@ -875,6 +880,22 @@ impl ExecutionPipeline {
                 ws.active_session_id = Some(session_id.clone());
             }
         }
+        self.persist_active_branch_pointer(&session_id, MAIN_BRANCH_ID)
+            .await;
+        if let Some(repo) = self.persistence_backend().await {
+            if let Err(err) = repo
+                .register_session_branch(&session_id, MAIN_BRANCH_ID)
+                .await
+            {
+                warn!(
+                    session_id = %session_id,
+                    error = %err,
+                    "failed to register main branch for new session in persistence backend"
+                );
+            }
+        }
+        self.persist_branch_state_value(&session_id, MAIN_BRANCH_ID, &SessionState::default())
+            .await;
 
         Ok(SessionCreateResponse {
             session_id,
@@ -898,6 +919,7 @@ impl ExecutionPipeline {
         session_id: &str,
         request: SendMessageRequestV1,
     ) -> Result<SendMessageResponseV1, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         self.record_execution_step(
             session_id,
             "API_ENTRY",
@@ -1259,6 +1281,7 @@ impl ExecutionPipeline {
         session_id: &str,
         request: RollbackRequest,
     ) -> Result<RollbackResponse, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         let lock_key = self.acquire_session_lock(session_id).await?;
 
         let result = async {
@@ -1350,6 +1373,7 @@ impl ExecutionPipeline {
         &self,
         request: ArtifactWriteRequest,
     ) -> Result<ArtifactEnvelope, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         let outcome = self
             .create_or_update_artifact_internal(
                 &request.session_id,
@@ -1405,6 +1429,7 @@ impl ExecutionPipeline {
         &self,
         request: WorkflowStartRequest,
     ) -> Result<WorkflowStateView, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         let now = now_ms();
         let record = WorkflowRecord {
             workflow_id: request.workflow_id.clone(),
@@ -1453,6 +1478,7 @@ impl ExecutionPipeline {
         workflow_id: &str,
         request: WorkflowStepRequest,
     ) -> Result<WorkflowStateView, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         let session_id = {
             let mut workflows = self.workflows.write().await;
             let record = workflows.get_mut(workflow_id).ok_or_else(|| {
@@ -1477,6 +1503,7 @@ impl ExecutionPipeline {
     pub async fn execute_next_workflow_job(
         &self,
     ) -> Result<Option<WorkflowExecutionResult>, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         let next_job = {
             let mut queue = self.workflow_queue.lock().await;
             if queue.is_empty() {
@@ -1530,6 +1557,7 @@ impl ExecutionPipeline {
         session_id: &str,
         request: ForceAgentRequest,
     ) -> Result<AgentSelectionView, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         let canonical = normalize_agent_name(&request.agent).ok_or_else(|| {
             PipelineError::InvalidInput("agent must be one of: claude | deepseek".to_owned())
         })?;
@@ -1626,8 +1654,10 @@ impl ExecutionPipeline {
 
     pub async fn debug_audit_branch(
         &self,
+        session_id: &str,
         branch_id: &str,
     ) -> Result<BranchAuditResponse, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         let redis_url = std::env::var("DELTA_AGENT_REDIS_URL").map_err(|_| {
             PipelineError::InvalidInput("DELTA_AGENT_REDIS_URL is not set".to_owned())
         })?;
@@ -1637,11 +1667,12 @@ impl ExecutionPipeline {
         let repo = RedisVddabRepository::connect(&redis_url, self.keyspace.clone(), vddab_root)
             .await
             .map_err(|err| PipelineError::Internal(format!("audit backend init failed: {err}")))?;
+        let storage_branch_id = persistence_branch_key(session_id, branch_id);
 
-        let chain = verify_chain(&repo, branch_id)
+        let chain = verify_chain(&repo, &storage_branch_id)
             .await
             .map_err(|err| PipelineError::Internal(format!("chain audit failed: {err}")))?;
-        let replay = audit_replay(&repo, &repo, branch_id)
+        let replay = audit_replay(&repo, &repo, &storage_branch_id)
             .await
             .map_err(|err| PipelineError::Internal(format!("replay audit failed: {err}")))?;
 
@@ -1670,6 +1701,173 @@ impl ExecutionPipeline {
         }
     }
 
+    async fn ensure_persistence_hydrated(&self) {
+        if self.persistence.is_none() {
+            return;
+        }
+        let _ = self
+            .persistence_hydration
+            .get_or_init(|| async {
+                if let Err(err) = self.hydrate_from_persistence().await {
+                    warn!(error = %err, "persistence hydration failed");
+                }
+            })
+            .await;
+    }
+
+    async fn hydrate_from_persistence(&self) -> Result<(), PipelineError> {
+        let Some(repo) = self.persistence_backend().await else {
+            return Ok(());
+        };
+
+        let session_ids = repo.list_sessions().await.map_err(|err| {
+            PipelineError::Internal(format!("failed to list persisted sessions: {err}"))
+        })?;
+        if session_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut max_id = self.id_counter.load(Ordering::Relaxed);
+        let mut recovered_deltashots = HashMap::<String, DeltashotRecord>::new();
+        let mut recovered_sessions = HashMap::<String, SessionRecord>::new();
+
+        for session_id in session_ids {
+            update_max_id_seed(&mut max_id, &session_id);
+            let mut branch_ids = repo
+                .list_session_branches(&session_id)
+                .await
+                .map_err(|err| {
+                    PipelineError::Internal(format!(
+                        "failed to load persisted branches for session '{}': {err}",
+                        session_id
+                    ))
+                })?;
+            if branch_ids.is_empty() {
+                branch_ids.push(MAIN_BRANCH_ID.to_owned());
+            }
+            if !branch_ids.iter().any(|branch| branch == MAIN_BRANCH_ID) {
+                branch_ids.push(MAIN_BRANCH_ID.to_owned());
+            }
+            let active_branch_id = repo
+                .get_session_active_branch(&session_id)
+                .await
+                .map_err(|err| {
+                    PipelineError::Internal(format!(
+                        "failed to load persisted active branch for session '{}': {err}",
+                        session_id
+                    ))
+                })?
+                .unwrap_or_else(|| MAIN_BRANCH_ID.to_owned());
+
+            let mut session = SessionRecord::new(
+                session_id.clone(),
+                "rehydrated".to_owned(),
+                "Rehydrated Session".to_owned(),
+            );
+            session.branches.clear();
+            session.active_branch_id = active_branch_id.clone();
+
+            for branch_id in branch_ids {
+                update_max_id_seed(&mut max_id, &branch_id);
+                let storage_branch_id = persistence_branch_key(&session_id, &branch_id);
+
+                let deltas = repo
+                    .load_branch_chain(&storage_branch_id)
+                    .await
+                    .map_err(|err| {
+                        PipelineError::Internal(format!(
+                            "failed to load persisted chain for '{}': {err}",
+                            storage_branch_id
+                        ))
+                    })?;
+                let mut replay_value = Value::Object(serde_json::Map::new());
+                let mut hashchain = Vec::with_capacity(deltas.len());
+                let mut deltashot_ids = Vec::with_capacity(deltas.len());
+                for ds in deltas {
+                    update_max_id_seed(&mut max_id, &ds.id);
+                    replay_value = apply_ops_to_state(&replay_value, &ds.ops)
+                        .map_err(|err| PipelineError::Internal(err.to_string()))?;
+                    let state_snapshot = state_from_value(replay_value.clone())?;
+                    recovered_deltashots.insert(
+                        ds.id.clone(),
+                        DeltashotRecord {
+                            id: ds.id.clone(),
+                            session_id: session_id.clone(),
+                            branch_id: branch_id.clone(),
+                            timestamp: ds.timestamp as u64,
+                            event_type: ds.metadata.event_type.clone(),
+                            ops: ds.ops.clone(),
+                            hash: ds.hash.clone(),
+                            prev_hash: ds.prev_hash.clone(),
+                            state_snapshot,
+                            metadata: ds.metadata.clone(),
+                        },
+                    );
+                    hashchain.push(ds.hash);
+                    deltashot_ids.push(ds.id);
+                }
+
+                let persisted_state = repo
+                    .get_branch_state(&storage_branch_id)
+                    .await
+                    .unwrap_or_else(|_| replay_value.clone());
+                let branch_state = state_from_value(persisted_state)
+                    .unwrap_or_else(|_| state_from_value(replay_value.clone()).unwrap_or_default());
+                let branch = BranchRecord {
+                    branch_id: branch_id.clone(),
+                    _session_id: session_id.clone(),
+                    _parent_deltashot_id: deltashot_ids.first().cloned().unwrap_or_default(),
+                    _created_at: now_ms(),
+                    label: if branch_id == MAIN_BRANCH_ID {
+                        None
+                    } else {
+                        Some("rehydrated".to_owned())
+                    },
+                    mode: BranchMode::Soft,
+                    state: branch_state,
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    hashchain,
+                    deltashot_ids,
+                    artifacts: HashSet::new(),
+                };
+                session.branches.insert(branch_id, branch);
+            }
+
+            if !session.branches.contains_key(&session.active_branch_id) {
+                session.active_branch_id = MAIN_BRANCH_ID.to_owned();
+            }
+            let active_branch_id = session.active_branch_id.clone();
+            if load_branch_into_session(&mut session, &active_branch_id).is_err() {
+                session.active_branch_id = MAIN_BRANCH_ID.to_owned();
+                let _ = load_branch_into_session(&mut session, MAIN_BRANCH_ID);
+            }
+            recovered_sessions.insert(session_id, session);
+        }
+
+        {
+            let mut sessions = self.sessions.write().await;
+            for (session_id, record) in recovered_sessions {
+                sessions.entry(session_id).or_insert(record);
+            }
+        }
+        {
+            let mut deltas = self.deltashots.write().await;
+            for (id, record) in recovered_deltashots {
+                deltas.entry(id).or_insert(record);
+            }
+        }
+        seed_counter(&self.id_counter, max_id.saturating_add(1));
+        Ok(())
+    }
+
+    async fn branch_deltashot_count(&self, session_id: &str, branch_id: &str) -> Option<usize> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(session_id)?;
+        let branch = session.branches.get(branch_id)?;
+        Some(branch.deltashot_ids.len())
+    }
+
     async fn persist_active_branch_pointer(&self, session_id: &str, branch_id: &str) {
         if let Some(repo) = self.persistence_backend().await {
             if let Err(err) = repo.set_session_active_branch(session_id, branch_id).await {
@@ -1683,35 +1881,29 @@ impl ExecutionPipeline {
         }
     }
 
-    async fn persist_branch_state_value(&self, branch_id: &str, state: &SessionState) {
+    async fn persist_branch_state_value(
+        &self,
+        session_id: &str,
+        branch_id: &str,
+        state: &SessionState,
+    ) {
         if let Some(repo) = self.persistence_backend().await {
+            let storage_branch_id = persistence_branch_key(session_id, branch_id);
             let value = value_from_state(state);
-            if let Err(err) = repo.store_branch_state(branch_id, &value).await {
+            if let Err(err) = repo.store_branch_state(&storage_branch_id, &value).await {
                 warn!(
                     branch_id = %branch_id,
+                    storage_branch_id = %storage_branch_id,
                     error = %err,
                     "failed to persist branch state"
                 );
-                return;
-            }
-            if state.version > 0 && state.version.is_multiple_of(SNAPSHOT_INTERVAL_EVENTS) {
-                if let Err(err) = repo
-                    .store_snapshot(branch_id, state.version as usize, &value)
-                    .await
-                {
-                    warn!(
-                        branch_id = %branch_id,
-                        version = state.version,
-                        error = %err,
-                        "failed to persist snapshot"
-                    );
-                }
             }
         }
     }
 
     async fn persist_deltashot_record(&self, record: &DeltashotRecord) {
         if let Some(repo) = self.persistence_backend().await {
+            let storage_branch_id = persistence_branch_key(&record.session_id, &record.branch_id);
             let delta = DeltaShot {
                 id: record.id.clone(),
                 session_id: record.session_id.clone(),
@@ -1731,10 +1923,14 @@ impl ExecutionPipeline {
                 }
             };
             let compressed = compress_ops(&ops_json);
-            if let Err(err) = repo.store_deltashot(&delta, &compressed).await {
+            if let Err(err) = repo
+                .store_deltashot(&delta, &storage_branch_id, &compressed)
+                .await
+            {
                 warn!(
                     deltashot_id = %record.id,
                     branch_id = %record.branch_id,
+                    storage_branch_id = %storage_branch_id,
                     error = %err,
                     "failed to persist deltashot"
                 );
@@ -1742,32 +1938,31 @@ impl ExecutionPipeline {
             }
             let state_value = value_from_state(&record.state_snapshot);
             if let Err(err) = repo
-                .store_branch_state(&record.branch_id, &state_value)
+                .store_branch_state(&storage_branch_id, &state_value)
                 .await
             {
                 warn!(
                     branch_id = %record.branch_id,
+                    storage_branch_id = %storage_branch_id,
                     error = %err,
                     "failed to persist branch state after deltashot"
                 );
             }
-            if record.state_snapshot.version > 0
-                && record
-                    .state_snapshot
-                    .version
-                    .is_multiple_of(SNAPSHOT_INTERVAL_EVENTS)
+            let snapshot_index = self
+                .branch_deltashot_count(&record.session_id, &record.branch_id)
+                .await
+                .unwrap_or(0);
+            if snapshot_index > 0
+                && snapshot_index.is_multiple_of(SNAPSHOT_INTERVAL_EVENTS as usize)
             {
                 if let Err(err) = repo
-                    .store_snapshot(
-                        &record.branch_id,
-                        record.state_snapshot.version as usize,
-                        &state_value,
-                    )
+                    .store_snapshot(&storage_branch_id, snapshot_index, &state_value)
                     .await
                 {
                     warn!(
                         branch_id = %record.branch_id,
-                        version = record.state_snapshot.version,
+                        storage_branch_id = %storage_branch_id,
+                        snapshot_index,
                         error = %err,
                         "failed to persist snapshot after deltashot"
                     );
@@ -1781,6 +1976,7 @@ impl ExecutionPipeline {
         session_id: &str,
         request: BranchCreateRequest,
     ) -> Result<BranchCreateResponse, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         if request.label.trim().is_empty() {
             return Err(PipelineError::InvalidInput(
                 "branch label cannot be empty".to_owned(),
@@ -1874,15 +2070,16 @@ impl ExecutionPipeline {
             artifacts: branch_artifacts,
         };
 
-        {
+        let active_branch_after_create = {
             let mut sessions = self.sessions.write().await;
             let session = sessions.get_mut(session_id).ok_or_else(|| {
                 PipelineError::NotFound(format!("session '{}' not found", session_id))
             })?;
             ensure_session_branches(session);
             session.branches.insert(branch_id.clone(), new_branch);
-        }
-        self.persist_active_branch_pointer(session_id, &branch_id)
+            session.active_branch_id.clone()
+        };
+        self.persist_active_branch_pointer(session_id, &active_branch_after_create)
             .await;
         if let Some(repo) = self.persistence_backend().await {
             if let Err(err) = repo.register_session_branch(session_id, &branch_id).await {
@@ -1894,7 +2091,7 @@ impl ExecutionPipeline {
                 );
             }
         }
-        self.persist_branch_state_value(&branch_id, &parent_state)
+        self.persist_branch_state_value(session_id, &branch_id, &parent_state)
             .await;
 
         Ok(BranchCreateResponse {
@@ -1941,6 +2138,7 @@ impl ExecutionPipeline {
         session_id: &str,
         request: BranchSwitchRequest,
     ) -> Result<BranchSwitchResponse, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         let branch_id = request.branch_id.clone();
         let mut sessions = self.sessions.write().await;
         let session = sessions.get_mut(session_id).ok_or_else(|| {
@@ -1963,6 +2161,7 @@ impl ExecutionPipeline {
         session_id: &str,
         request: BranchMergeRequest,
     ) -> Result<BranchMergeResponse, PipelineError> {
+        self.ensure_persistence_hydrated().await;
         let strategy = request.strategy.to_ascii_lowercase();
         let source_branch_id = request.source_branch.clone();
         let target_branch_id = request.target_branch.clone();
@@ -2070,6 +2269,7 @@ impl ExecutionPipeline {
         request: StreamMessageRequestV1,
         idempotency_key: Option<String>,
     ) -> Vec<StreamEventEnvelope> {
+        self.ensure_persistence_hydrated().await;
         let cache_key = idempotency_key
             .as_ref()
             .map(|key| format!("{session_id}:{key}"));
@@ -2593,7 +2793,8 @@ impl ExecutionPipeline {
         let branch_id = session.active_branch_id.clone();
         let state = session.state.clone();
         drop(sessions);
-        self.persist_branch_state_value(&branch_id, &state).await;
+        self.persist_branch_state_value(session_id, &branch_id, &state)
+            .await;
         Ok(())
     }
 
@@ -3036,6 +3237,44 @@ fn stream_event<T: Serialize>(event: &str, data: T) -> StreamEventEnvelope {
     StreamEventEnvelope {
         event: event.to_owned(),
         data: payload,
+    }
+}
+
+fn persistence_branch_key(session_id: &str, branch_id: &str) -> String {
+    format!(
+        "s{}_{}_b{}_{}",
+        session_id.len(),
+        session_id,
+        branch_id.len(),
+        branch_id
+    )
+}
+
+fn update_max_id_seed(seed: &mut u64, id: &str) {
+    if let Some((_, suffix)) = id.rsplit_once('_') {
+        if let Ok(parsed) = suffix.parse::<u64>() {
+            *seed = (*seed).max(parsed);
+        }
+    }
+}
+
+fn seed_counter(counter: &AtomicU64, candidate_next: u64) {
+    loop {
+        let current = counter.load(Ordering::Relaxed);
+        if current >= candidate_next {
+            return;
+        }
+        if counter
+            .compare_exchange(
+                current,
+                candidate_next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return;
+        }
     }
 }
 

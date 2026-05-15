@@ -6,7 +6,7 @@ use anyhow::Result;
 use deltashot::{apply_ops, canonical_serialize_ops, compute_chain_hash, DeltaShot, Op};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationResult {
@@ -113,12 +113,14 @@ pub async fn audit_replay(
 ) -> Result<ReplayAuditResult> {
     let deltas = delta_repo.load_branch_chain(branch_id).await?;
 
-    let (mut state, start_index) = state_repo.load_nearest_snapshot(branch_id).await?;
-    if start_index > deltas.len() {
-        anyhow::bail!(
-            "snapshot start index {} out of range for {} deltas",
-            start_index,
-            deltas.len()
+    let (mut state, loaded_start_index) = state_repo.load_nearest_snapshot(branch_id).await?;
+    let start_index = loaded_start_index.min(deltas.len());
+    if loaded_start_index != start_index {
+        warn!(
+            branch_id = %branch_id,
+            loaded_start_index,
+            deltas_len = deltas.len(),
+            "snapshot start index out of range, falling back to full replay"
         );
     }
 
@@ -156,6 +158,40 @@ pub async fn audit_replay(
 
     let stored = state_repo.get_branch_state(branch_id).await?;
     let final_state_match = state == stored;
+    if !final_state_match && start_index > 0 {
+        warn!(
+            branch_id = %branch_id,
+            start_index,
+            "snapshot replay mismatch, retrying from genesis"
+        );
+        let mut full_state = Value::Object(serde_json::Map::new());
+        let mut full_last_hash = String::new();
+        for ds in &deltas {
+            let compressed = delta_repo.load_compressed_ops(&ds.id).await?;
+            let decompressed = decompress_ops(&compressed)?;
+            let ops: Vec<Op> = serde_json::from_slice(&decompressed)?;
+            apply_ops(&mut full_state, &ops)?;
+            let canonical = canonical_serialize_ops(&ops)?;
+            let recomputed = compute_chain_hash(&full_last_hash, &canonical);
+            if recomputed != ds.hash
+                || (!full_last_hash.is_empty() && ds.prev_hash != full_last_hash)
+            {
+                error!("Mismatch at DeltaShot {}", ds.id);
+                return Ok(ReplayAuditResult {
+                    valid: false,
+                    final_state_match: false,
+                    hash_match: false,
+                });
+            }
+            full_last_hash = recomputed;
+        }
+        let full_match = full_state == stored;
+        return Ok(ReplayAuditResult {
+            valid: full_match,
+            final_state_match: full_match,
+            hash_match: true,
+        });
+    }
 
     Ok(ReplayAuditResult {
         valid: final_state_match,
