@@ -1,9 +1,9 @@
 pub mod api_v1;
 
-use axum::Router;
 use axum::middleware;
+use axum::Router;
 
-use crate::middleware::auth::{AuthConfig, authentication_middleware};
+use crate::middleware::auth::{authentication_middleware, AuthConfig};
 use crate::pipeline::PipelineState;
 
 pub fn router(state: PipelineState) -> Router {

@@ -164,7 +164,10 @@ pub async fn authentication_middleware(
 }
 
 fn extract_api_key(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get(AUTHORIZATION).and_then(|header| header.to_str().ok()) {
+    if let Some(value) = headers
+        .get(AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())
+    {
         let trimmed = value.trim();
         if let Some(token) = trimmed.strip_prefix("Bearer ") {
             let key = token.trim();
