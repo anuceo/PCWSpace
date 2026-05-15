@@ -186,7 +186,9 @@ async fn get_session_messages(
     let limit = query.limit.unwrap_or(50);
     let cursor = query.cursor;
     with_meta(async move {
-        let data = state.get_session_messages(&session_id, limit, cursor).await;
+        let data = state
+            .get_session_messages(&session_id, limit, cursor)
+            .await?;
         Ok::<Vec<MessageRecord>, PipelineError>(data)
     })
     .await
@@ -197,7 +199,7 @@ async fn list_deltashots(
     State(state): State<Arc<PipelineState>>,
 ) -> impl IntoResponse {
     with_meta(async move {
-        let data = state.list_deltashots(&session_id).await;
+        let data = state.list_deltashots(&session_id).await?;
         Ok::<Vec<DeltashotView>, PipelineError>(data)
     })
     .await
@@ -335,7 +337,7 @@ async fn get_agent_logs(
     State(state): State<Arc<PipelineState>>,
 ) -> impl IntoResponse {
     with_meta(async move {
-        let data = state.get_agent_logs(&session_id).await;
+        let data = state.get_agent_logs(&session_id).await?;
         Ok::<_, PipelineError>(data)
     })
     .await
@@ -346,7 +348,7 @@ async fn get_trace(
     State(state): State<Arc<PipelineState>>,
 ) -> impl IntoResponse {
     with_meta(async move {
-        let trace = state.get_trace(&session_id).await;
+        let trace = state.get_trace(&session_id).await?;
         Ok::<ExecutionTrace, PipelineError>(trace)
     })
     .await

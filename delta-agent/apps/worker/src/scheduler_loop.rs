@@ -6,17 +6,12 @@ use tracing::{info, warn, Level};
 
 use crate::config::WorkerConfig;
 
-pub async fn run(config: WorkerConfig) {
+pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     init_tracing();
-    let client = match reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(config.request_timeout_ms))
         .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            panic!("failed to build worker HTTP client: {error}");
-        }
-    };
+        .context("failed to build worker HTTP client")?;
     let headers = build_auth_headers(config.api_key.as_deref());
 
     info!(

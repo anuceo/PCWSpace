@@ -14,8 +14,7 @@ async fn main() {
     };
     let worker_config = apply_env_overrides(worker_config);
 
-    scheduler_loop::run(worker_config).await;
-    if let Err(error) = Ok::<(), anyhow::Error>(()) {
+    if let Err(error) = scheduler_loop::run(worker_config).await {
         eprintln!("worker failed: {error:?}");
         std::process::exit(1);
     }

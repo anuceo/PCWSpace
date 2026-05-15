@@ -352,6 +352,8 @@ pub struct NotionSyncExecutionResult {
     pub session_id: String,
     pub artifacts_count: usize,
     pub summary_preview: String,
+    pub status: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -689,6 +691,12 @@ struct NotionSyncJob {
     artifacts: Vec<String>,
     timestamp_ms: u64,
     attempt: u32,
+}
+
+#[derive(Debug, Clone)]
+enum NotionSyncOutcome {
+    Synced,
+    Skipped(String),
 }
 
 #[derive(Debug, Clone)]
@@ -1036,12 +1044,25 @@ impl ExecutionPipeline {
         })
     }
 
+    async fn ensure_session_exists(&self, session_id: &str) -> Result<(), PipelineError> {
+        let sessions = self.sessions.read().await;
+        if sessions.contains_key(session_id) {
+            Ok(())
+        } else {
+            Err(PipelineError::NotFound(format!(
+                "session '{}' not found",
+                session_id
+            )))
+        }
+    }
+
     pub async fn handle_message_v1(
         &self,
         session_id: &str,
         request: SendMessageRequestV1,
     ) -> Result<SendMessageResponseV1, PipelineError> {
         self.ensure_persistence_hydrated().await;
+        self.ensure_session_exists(session_id).await?;
         self.record_execution_step(
             session_id,
             "API_ENTRY",
@@ -1080,7 +1101,7 @@ impl ExecutionPipeline {
         session_id: &str,
         request: SendMessageRequestV1,
     ) -> Result<SendMessageResponseV1, PipelineError> {
-        let context = self.hydrate_context(session_id).await;
+        let context = self.hydrate_context(session_id).await?;
         self.record_execution_step(
             session_id,
             "SESSION_HYDRATED",
@@ -1293,24 +1314,6 @@ impl ExecutionPipeline {
         })
     }
 
-    pub async fn get_or_create_session_view(&self, session_id: &str) -> SessionView {
-        let mut sessions = self.sessions.write().await;
-        let record = sessions.entry(session_id.to_owned()).or_insert_with(|| {
-            SessionRecord::new(
-                session_id.to_owned(),
-                "adhoc".to_owned(),
-                "Adhoc Session".to_owned(),
-            )
-        });
-
-        SessionView {
-            session_id: record.session_id.clone(),
-            status: record.status.clone(),
-            workflow_id: record.workflow_id.clone(),
-            state_version: record.state.version,
-        }
-    }
-
     pub async fn get_session_state(&self, session_id: &str) -> Option<SessionStateResponse> {
         let sessions = self.sessions.read().await;
         let session = sessions.get(session_id)?;
@@ -1331,10 +1334,13 @@ impl ExecutionPipeline {
         session_id: &str,
         limit: usize,
         cursor: Option<String>,
-    ) -> Vec<MessageRecord> {
+    ) -> Result<Vec<MessageRecord>, PipelineError> {
         let sessions = self.sessions.read().await;
         let Some(session) = sessions.get(session_id) else {
-            return Vec::new();
+            return Err(PipelineError::NotFound(format!(
+                "session '{}' not found",
+                session_id
+            )));
         };
 
         let mut messages = session.messages.clone();
@@ -1344,7 +1350,7 @@ impl ExecutionPipeline {
             }
         }
 
-        messages
+        Ok(messages
             .into_iter()
             .rev()
             .take(limit.max(1))
@@ -1354,19 +1360,26 @@ impl ExecutionPipeline {
                 content: m.content,
                 timestamp: m.timestamp,
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>())
     }
 
-    pub async fn list_deltashots(&self, session_id: &str) -> Vec<DeltashotView> {
+    pub async fn list_deltashots(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<DeltashotView>, PipelineError> {
         let sessions = self.sessions.read().await;
         let Some(session) = sessions.get(session_id) else {
-            return Vec::new();
+            return Err(PipelineError::NotFound(format!(
+                "session '{}' not found",
+                session_id
+            )));
         };
         let ids = session.deltashot_ids.clone();
         drop(sessions);
 
         let map = self.deltashots.read().await;
-        ids.iter()
+        Ok(ids
+            .iter()
             .filter_map(|id| map.get(id))
             .map(|ds| DeltashotView {
                 id: ds.id.clone(),
@@ -1380,7 +1393,7 @@ impl ExecutionPipeline {
                     Some(ds.prev_hash.clone())
                 },
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>())
     }
 
     pub async fn get_deltashot(&self, deltashot_id: &str) -> Option<DeltashotView> {
@@ -1434,13 +1447,10 @@ impl ExecutionPipeline {
             let rebuilt_state = self.replay_state_from_deltashot_ids(&replay_ids).await?;
 
             let mut sessions = self.sessions.write().await;
-            let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
-                SessionRecord::new(
-                    session_id.to_owned(),
-                    "adhoc".to_owned(),
-                    "Adhoc Session".to_owned(),
-                )
+            let session = sessions.get_mut(session_id).ok_or_else(|| {
+                PipelineError::NotFound(format!("session '{}' not found", session_id))
             });
+            let session = session?;
             ensure_session_branches(session);
             session.state = rebuilt_state.clone();
 
@@ -1498,6 +1508,7 @@ impl ExecutionPipeline {
         request: ArtifactWriteRequest,
     ) -> Result<ArtifactEnvelope, PipelineError> {
         self.ensure_persistence_hydrated().await;
+        self.ensure_session_exists(&request.session_id).await?;
         let outcome = self
             .create_or_update_artifact_internal(
                 &request.session_id,
@@ -1554,6 +1565,7 @@ impl ExecutionPipeline {
         request: WorkflowStartRequest,
     ) -> Result<WorkflowStateView, PipelineError> {
         self.ensure_persistence_hydrated().await;
+        self.ensure_session_exists(&request.session_id).await?;
         let now = now_ms();
         let record = WorkflowRecord {
             workflow_id: request.workflow_id.clone(),
@@ -1679,15 +1691,22 @@ impl ExecutionPipeline {
             return Ok(None);
         };
 
-        if let Err(error) = self.perform_notion_sync(&job).await {
-            warn!(
-                session_id = %job.session_id,
-                attempt = job.attempt,
-                error = %error,
-                "notion sync execution failed"
-            );
-            self.requeue_notion_sync_job(job.clone(), source).await;
-        }
+        let (status, detail) = match self.perform_notion_sync(&job).await {
+            Ok(NotionSyncOutcome::Synced) => {
+                ("synced".to_owned(), "notion page updated".to_owned())
+            }
+            Ok(NotionSyncOutcome::Skipped(reason)) => ("skipped".to_owned(), reason),
+            Err(error) => {
+                warn!(
+                    session_id = %job.session_id,
+                    attempt = job.attempt,
+                    error = %error,
+                    "notion sync execution failed"
+                );
+                self.requeue_notion_sync_job(job.clone(), source).await;
+                return Err(error);
+            }
+        };
 
         let preview = job.summary.chars().take(140).collect::<String>();
         info!(
@@ -1701,20 +1720,29 @@ impl ExecutionPipeline {
             session_id: job.session_id,
             artifacts_count: job.artifacts.len(),
             summary_preview: preview,
+            status,
+            detail,
         }))
     }
 
-    async fn perform_notion_sync(&self, job: &NotionSyncJob) -> Result<(), PipelineError> {
+    async fn perform_notion_sync(
+        &self,
+        job: &NotionSyncJob,
+    ) -> Result<NotionSyncOutcome, PipelineError> {
         if !self.notion_sync_config.is_active() {
             info!(
                 session_id = %job.session_id,
                 "notion sync skipped because integration is not configured"
             );
-            return Ok(());
+            return Ok(NotionSyncOutcome::Skipped(
+                "integration disabled or incomplete".to_owned(),
+            ));
         }
 
         let Some(token) = self.notion_sync_config.token.as_ref() else {
-            return Ok(());
+            return Ok(NotionSyncOutcome::Skipped(
+                "missing NOTION_TOKEN".to_owned(),
+            ));
         };
 
         let mut properties = serde_json::Map::new();
@@ -1731,7 +1759,9 @@ impl ExecutionPipeline {
         } else if let Some(database_id) = self.notion_sync_config.database_id.as_ref() {
             serde_json::json!({ "database_id": database_id })
         } else {
-            return Ok(());
+            return Ok(NotionSyncOutcome::Skipped(
+                "missing NOTION_DATABASE_ID or NOTION_PARENT_PAGE_ID".to_owned(),
+            ));
         };
 
         let summary_preview = truncate_for_notion(&job.summary, 1800);
@@ -1773,7 +1803,7 @@ impl ExecutionPipeline {
             .map_err(|err| PipelineError::Internal(format!("notion request failed: {err}")))?;
 
         if response.status().is_success() {
-            return Ok(());
+            return Ok(NotionSyncOutcome::Synced);
         }
 
         let status = response.status();
@@ -1822,22 +1852,22 @@ impl ExecutionPipeline {
         request: ForceAgentRequest,
     ) -> Result<AgentSelectionView, PipelineError> {
         self.ensure_persistence_hydrated().await;
+        self.ensure_session_exists(session_id).await?;
         let canonical = normalize_agent_name(&request.agent).ok_or_else(|| {
             PipelineError::InvalidInput("agent must be one of: claude | deepseek".to_owned())
         })?;
 
         let mut sessions = self.sessions.write().await;
-        let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
-            SessionRecord::new(
-                session_id.to_owned(),
-                "adhoc".to_owned(),
-                "Adhoc Session".to_owned(),
-            )
-        });
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            PipelineError::NotFound(format!("session '{}' not found", session_id))
+        })?;
         session.forced_agent = Some(ForcedAgent {
             agent: canonical.to_owned(),
             reason: request.reason.clone(),
         });
+        let snapshot = session.clone();
+        drop(sessions);
+        self.persist_session_meta_record(&snapshot).await;
 
         Ok(AgentSelectionView {
             session_id: session_id.to_owned(),
@@ -1846,24 +1876,26 @@ impl ExecutionPipeline {
         })
     }
 
-    pub async fn get_agent_logs(&self, session_id: &str) -> Vec<AgentLogEntry> {
+    pub async fn get_agent_logs(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<AgentLogEntry>, PipelineError> {
+        self.ensure_session_exists(session_id).await?;
         let logs = self.agent_logs.read().await;
-        logs.get(session_id).cloned().unwrap_or_default()
+        Ok(logs.get(session_id).cloned().unwrap_or_default())
     }
 
-    pub async fn get_trace(&self, session_id: &str) -> ExecutionTrace {
+    pub async fn get_trace(&self, session_id: &str) -> Result<ExecutionTrace, PipelineError> {
         let session_opt = {
             let sessions = self.sessions.read().await;
             sessions.get(session_id).cloned()
         };
 
         let Some(session) = session_opt else {
-            return ExecutionTrace {
-                messages: Vec::new(),
-                deltashots: Vec::new(),
-                state_transitions: Vec::new(),
-                artifacts: Vec::new(),
-            };
+            return Err(PipelineError::NotFound(format!(
+                "session '{}' not found",
+                session_id
+            )));
         };
 
         let messages = session
@@ -1902,12 +1934,12 @@ impl ExecutionPipeline {
                 .collect::<Vec<_>>()
         };
 
-        ExecutionTrace {
+        Ok(ExecutionTrace {
             messages,
-            deltashots: self.list_deltashots(session_id).await,
+            deltashots: self.list_deltashots(session_id).await?,
             state_transitions,
             artifacts,
-        }
+        })
     }
 
     pub fn health(&self) -> HealthResponse {
@@ -1922,15 +1954,19 @@ impl ExecutionPipeline {
         branch_id: &str,
     ) -> Result<BranchAuditResponse, PipelineError> {
         self.ensure_persistence_hydrated().await;
-        let redis_url = std::env::var("DELTA_AGENT_REDIS_URL").map_err(|_| {
-            PipelineError::InvalidInput("DELTA_AGENT_REDIS_URL is not set".to_owned())
-        })?;
-        let vddab_root =
-            std::env::var("DELTA_AGENT_VDDAB_ROOT").unwrap_or_else(|_| "./data/vddab".to_owned());
+        let Some(config) = self.persistence.as_ref() else {
+            return Err(PipelineError::InvalidInput(
+                "persistence backend is not configured".to_owned(),
+            ));
+        };
 
-        let repo = RedisVddabRepository::connect(&redis_url, self.keyspace.clone(), vddab_root)
-            .await
-            .map_err(|err| PipelineError::Internal(format!("audit backend init failed: {err}")))?;
+        let repo = RedisVddabRepository::connect(
+            &config.redis_url,
+            self.keyspace.clone(),
+            config.vddab_root.clone(),
+        )
+        .await
+        .map_err(|err| PipelineError::Internal(format!("audit backend init failed: {err}")))?;
         let storage_branch_id = persistence_branch_key(session_id, branch_id);
 
         let chain = verify_chain(&repo, &storage_branch_id)
@@ -2038,6 +2074,12 @@ impl ExecutionPipeline {
                 session.created_at = meta.created_at;
                 session.status = meta.status;
                 session.workflow_id = meta.workflow_id;
+                session.forced_agent = meta.forced_agent.map(|agent| ForcedAgent {
+                    agent,
+                    reason: meta
+                        .forced_agent_reason
+                        .unwrap_or_else(|| "persisted".to_owned()),
+                });
             }
             let mut branch_messages = HashMap::<String, Vec<ChatMessage>>::new();
             match repo.load_session_messages(&session_id).await {
@@ -2490,6 +2532,14 @@ impl ExecutionPipeline {
                 created_at: session.created_at,
                 status: session.status.clone(),
                 workflow_id: session.workflow_id.clone(),
+                forced_agent: session
+                    .forced_agent
+                    .as_ref()
+                    .map(|forced| forced.agent.clone()),
+                forced_agent_reason: session
+                    .forced_agent
+                    .as_ref()
+                    .map(|forced| forced.reason.clone()),
             };
             if let Err(err) = repo.store_session_meta(&persisted).await {
                 warn!(
@@ -2920,6 +2970,20 @@ impl ExecutionPipeline {
             .unwrap_or_else(|| format!("req_{}", uuid::Uuid::new_v4().simple()));
         let mut events = vec![stream_event("ack", StreamAckEvent { request_id })];
 
+        if let Err(error) = self.ensure_session_exists(session_id).await {
+            events.push(stream_event(
+                "error",
+                StreamErrorEvent {
+                    code: error.code().to_owned(),
+                    retryable: error.retryable(),
+                },
+            ));
+            if let Some(key) = cache_key.as_ref() {
+                self.store_cached_stream_events(key, &events).await;
+            }
+            return events;
+        }
+
         if request.content.trim().is_empty() {
             events.push(stream_event(
                 "error",
@@ -3005,7 +3069,7 @@ impl ExecutionPipeline {
         request: StreamMessageRequestV1,
         events: &mut Vec<StreamEventEnvelope>,
     ) -> Result<(), PipelineError> {
-        let context = self.hydrate_context(session_id).await;
+        let context = self.hydrate_context(session_id).await?;
         let _ = self
             .append_message(session_id, "user", &request.content)
             .await?;
@@ -3240,27 +3304,23 @@ impl ExecutionPipeline {
         ))
     }
 
-    async fn hydrate_context(&self, session_id: &str) -> SessionContext {
+    async fn hydrate_context(&self, session_id: &str) -> Result<SessionContext, PipelineError> {
         let mut sessions = self.sessions.write().await;
-        let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
-            SessionRecord::new(
-                session_id.to_owned(),
-                "adhoc".to_owned(),
-                "Adhoc Session".to_owned(),
-            )
-        });
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            PipelineError::NotFound(format!("session '{}' not found", session_id))
+        })?;
         ensure_session_branches(session);
 
         let mut memory = session.messages.clone();
         memory.reverse();
         memory.truncate(RECENT_MESSAGE_WINDOW);
 
-        SessionContext {
+        Ok(SessionContext {
             state: session.state.clone(),
             memory,
             workflow_id: session.workflow_id.clone(),
             forced_agent: session.forced_agent.clone(),
-        }
+        })
     }
 
     async fn acquire_session_lock(
@@ -3456,13 +3516,9 @@ impl ExecutionPipeline {
         };
 
         let mut sessions = self.sessions.write().await;
-        let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
-            SessionRecord::new(
-                session_id.to_owned(),
-                "adhoc".to_owned(),
-                "Adhoc Session".to_owned(),
-            )
-        });
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            PipelineError::NotFound(format!("session '{}' not found", session_id))
+        })?;
         ensure_session_branches(session);
         let branch_id = session.active_branch_id.clone();
         session.messages.push(message.clone());
@@ -3488,13 +3544,9 @@ impl ExecutionPipeline {
         };
 
         let mut sessions = self.sessions.write().await;
-        let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
-            SessionRecord::new(
-                session_id.to_owned(),
-                "adhoc".to_owned(),
-                "Adhoc Session".to_owned(),
-            )
-        });
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            PipelineError::NotFound(format!("session '{}' not found", session_id))
+        })?;
         ensure_session_branches(session);
         let branch_id = session.active_branch_id.clone();
         session.events.push(event.clone());
@@ -3514,13 +3566,9 @@ impl ExecutionPipeline {
         metadata: DeltaShotMetadata,
     ) -> Result<DeltashotRecord, PipelineError> {
         let mut sessions = self.sessions.write().await;
-        let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
-            SessionRecord::new(
-                session_id.to_owned(),
-                "adhoc".to_owned(),
-                "Adhoc Session".to_owned(),
-            )
-        });
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            PipelineError::NotFound(format!("session '{}' not found", session_id))
+        })?;
         ensure_session_branches(session);
 
         let id = self.next_id("ds");
@@ -3564,13 +3612,10 @@ impl ExecutionPipeline {
     ) -> Result<ArtifactWriteOutcome, PipelineError> {
         let (active_branch_id, branch_artifact_ids) = {
             let mut sessions = self.sessions.write().await;
-            let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
-                SessionRecord::new(
-                    session_id.to_owned(),
-                    "adhoc".to_owned(),
-                    "Adhoc Session".to_owned(),
-                )
+            let session = sessions.get_mut(session_id).ok_or_else(|| {
+                PipelineError::NotFound(format!("session '{}' not found", session_id))
             });
+            let session = session?;
             ensure_session_branches(session);
             (session.active_branch_id.clone(), session.artifacts.clone())
         };
@@ -3647,13 +3692,9 @@ impl ExecutionPipeline {
 
         {
             let mut sessions = self.sessions.write().await;
-            let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
-                SessionRecord::new(
-                    session_id.to_owned(),
-                    "adhoc".to_owned(),
-                    "Adhoc Session".to_owned(),
-                )
-            });
+            let session = sessions.get_mut(session_id).ok_or_else(|| {
+                PipelineError::NotFound(format!("session '{}' not found", session_id))
+            })?;
             ensure_session_branches(session);
             if let Some(previous_id) = replaced_artifact_id {
                 session.artifacts.remove(&previous_id);
@@ -3681,13 +3722,9 @@ impl ExecutionPipeline {
         next_state: SessionState,
     ) -> Result<(), PipelineError> {
         let mut sessions = self.sessions.write().await;
-        let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
-            SessionRecord::new(
-                session_id.to_owned(),
-                "adhoc".to_owned(),
-                "Adhoc Session".to_owned(),
-            )
-        });
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            PipelineError::NotFound(format!("session '{}' not found", session_id))
+        })?;
         ensure_session_branches(session);
         session.state = next_state;
         sync_active_branch_from_session(session);
@@ -3737,13 +3774,14 @@ impl ExecutionPipeline {
 
     async fn bind_session_workflow(&self, session_id: &str, workflow_id: &str) {
         let mut sessions = self.sessions.write().await;
-        let session = sessions.entry(session_id.to_owned()).or_insert_with(|| {
-            SessionRecord::new(
-                session_id.to_owned(),
-                "adhoc".to_owned(),
-                "Adhoc Session".to_owned(),
-            )
-        });
+        let Some(session) = sessions.get_mut(session_id) else {
+            warn!(
+                session_id = %session_id,
+                workflow_id = %workflow_id,
+                "cannot bind workflow to missing session"
+            );
+            return;
+        };
         session.workflow_id = Some(workflow_id.to_owned());
         let snapshot = session.clone();
         drop(sessions);
@@ -4064,35 +4102,73 @@ fn build_agent_output_from_text(
     mode: &MessageMode,
     response_text: String,
 ) -> AgentOutput {
+    let structured = parse_structured_agent_response(&response_text);
     let lower = input.to_ascii_lowercase();
-    let proposed_goal = if lower.contains("finalize") {
-        Some("finalize landing page".to_owned())
-    } else if lower.contains("draft") {
-        Some("draft landing page".to_owned())
-    } else {
-        context.state.goal.clone()
-    };
+    let (structured_text, structured_goal, structured_step, structured_artifact) =
+        if let Some(structured) = structured {
+            let StructuredAgentResponse {
+                response,
+                step,
+                state,
+                artifact,
+            } = structured;
+            let (goal_from_state, step_from_state) = if let Some(state) = state {
+                (state.goal, state.step)
+            } else {
+                (None, None)
+            };
+            (
+                response,
+                goal_from_state,
+                step_from_state.or(step),
+                artifact,
+            )
+        } else {
+            (None, None, None, None)
+        };
 
-    let proposed_step = if lower.contains("refine") || lower.contains("finalize") {
-        Some("refine".to_owned())
-    } else if lower.contains("draft") {
-        Some("draft".to_owned())
-    } else {
-        Some("continue".to_owned())
-    };
+    let proposed_goal = structured_goal.or_else(|| {
+        if lower.contains("finalize") {
+            Some("finalize landing page".to_owned())
+        } else if lower.contains("draft") {
+            Some("draft landing page".to_owned())
+        } else {
+            context.state.goal.clone()
+        }
+    });
 
-    let (artifact_type, artifact_content) = if lower.contains("artifact")
+    let proposed_step = structured_step.or_else(|| {
+        if lower.contains("refine") || lower.contains("finalize") {
+            Some("refine".to_owned())
+        } else if lower.contains("draft") {
+            Some("draft".to_owned())
+        } else {
+            Some("continue".to_owned())
+        }
+    });
+
+    let (artifact_type, artifact_content) = if let Some(artifact) = structured_artifact {
+        (
+            Some(artifact.artifact_type.unwrap_or_else(|| "code".to_owned())),
+            artifact
+                .content
+                .map(|content| truncate_for_notion(&content, 8_000))
+                .or_else(|| Some(render_artifact_content("code", &response_text))),
+        )
+    } else if lower.contains("artifact")
         || lower.contains("code")
         || matches!(mode, MessageMode::Execution)
     {
-        let rendered = render_artifact_content("code", input);
+        let rendered = render_artifact_content("code", &response_text);
         (Some("code".to_owned()), Some(rendered))
     } else {
         (None, None)
     };
 
     AgentOutput {
-        text: response_text,
+        text: structured_text
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or(response_text),
         proposed_goal,
         proposed_step,
         artifact_type,
@@ -4101,9 +4177,83 @@ fn build_agent_output_from_text(
 }
 
 fn render_artifact_content(artifact_type: &str, source: &str) -> String {
-    format!(
-        "{{\"type\":\"{artifact_type}\",\"rendered_from\":\"{source}\",\"engine\":\"deterministic\"}}"
-    )
+    if let Some(code) = extract_fenced_block(source) {
+        return code;
+    }
+    if source.trim().is_empty() {
+        return format!("artifact:{artifact_type}");
+    }
+    source.trim().to_owned()
+}
+
+#[derive(Debug, Deserialize)]
+struct StructuredAgentResponse {
+    #[serde(default)]
+    response: Option<String>,
+    #[serde(default)]
+    step: Option<String>,
+    #[serde(default)]
+    state: Option<StructuredAgentState>,
+    #[serde(default)]
+    artifact: Option<StructuredAgentArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StructuredAgentState {
+    #[serde(default)]
+    goal: Option<String>,
+    #[serde(default)]
+    step: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StructuredAgentArtifact {
+    #[serde(default, rename = "type")]
+    artifact_type: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+fn parse_structured_agent_response(raw: &str) -> Option<StructuredAgentResponse> {
+    for candidate in structured_json_candidates(raw) {
+        if let Ok(parsed) = serde_json::from_str::<StructuredAgentResponse>(&candidate) {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn structured_json_candidates(raw: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        candidates.push(trimmed.to_owned());
+    }
+    if let Some(block) = extract_tagged_fenced_block(trimmed, "json") {
+        candidates.push(block);
+    }
+    if let Some(block) = extract_fenced_block(trimmed) {
+        let block_trimmed = block.trim();
+        if block_trimmed.starts_with('{') && block_trimmed.ends_with('}') {
+            candidates.push(block_trimmed.to_owned());
+        }
+    }
+    candidates
+}
+
+fn extract_tagged_fenced_block(input: &str, tag: &str) -> Option<String> {
+    let open = format!("```{tag}");
+    let start = input.find(&open)?;
+    let after_open = &input[start + open.len()..];
+    let end = after_open.find("```")?;
+    Some(after_open[..end].trim().to_owned())
+}
+
+fn extract_fenced_block(input: &str) -> Option<String> {
+    let start = input.find("```")?;
+    let after_open = &input[start + 3..];
+    let end = after_open.find("```")?;
+    Some(after_open[..end].trim().to_owned())
 }
 
 fn apply_state_mutation(

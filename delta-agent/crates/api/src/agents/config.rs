@@ -53,6 +53,7 @@ impl Default for AgentRuntimeConfig {
 impl AgentRuntimeConfig {
     pub fn from_env() -> Self {
         let mut config = Self::default();
+        let use_real_agents_explicit = std::env::var("DELTA_AGENT_USE_REAL_AGENTS").ok();
         config.use_real_agents =
             read_bool_env("DELTA_AGENT_USE_REAL_AGENTS", config.use_real_agents);
         config.connect_timeout_ms =
@@ -74,6 +75,11 @@ impl AgentRuntimeConfig {
             read_string_env("DEEPSEEK_BASE_URL").unwrap_or(config.deepseek_base_url);
         config.deepseek_api_key = read_string_env("DEEPSEEK_API_KEY");
         config.deepseek_model = read_string_env("DEEPSEEK_MODEL").unwrap_or(config.deepseek_model);
+        if use_real_agents_explicit.is_none()
+            && (config.anthropic_api_key.is_some() || config.deepseek_api_key.is_some())
+        {
+            config.use_real_agents = true;
+        }
         config
     }
 

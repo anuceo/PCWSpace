@@ -57,6 +57,10 @@ pub struct PersistedSessionMeta {
     pub created_at: u64,
     pub status: String,
     pub workflow_id: Option<String>,
+    #[serde(default)]
+    pub forced_agent: Option<String>,
+    #[serde(default)]
+    pub forced_agent_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -760,6 +764,58 @@ impl RedisVddabRepository {
                     format!("failed to clear workflow id for '{}'", session.session_id)
                 })?;
         }
+        if let Some(forced_agent) = session.forced_agent.as_ref() {
+            let _: () = redis::cmd("HSET")
+                .arg(&key)
+                .arg("forced_agent")
+                .arg(forced_agent)
+                .query_async(&mut conn)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to persist forced agent for session '{}'",
+                        session.session_id
+                    )
+                })?;
+        } else {
+            let _: () = redis::cmd("HDEL")
+                .arg(&key)
+                .arg("forced_agent")
+                .query_async(&mut conn)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to clear forced agent for session '{}'",
+                        session.session_id
+                    )
+                })?;
+        }
+        if let Some(reason) = session.forced_agent_reason.as_ref() {
+            let _: () = redis::cmd("HSET")
+                .arg(&key)
+                .arg("forced_agent_reason")
+                .arg(reason)
+                .query_async(&mut conn)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to persist forced agent reason for session '{}'",
+                        session.session_id
+                    )
+                })?;
+        } else {
+            let _: () = redis::cmd("HDEL")
+                .arg(&key)
+                .arg("forced_agent_reason")
+                .query_async(&mut conn)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to clear forced agent reason for session '{}'",
+                        session.session_id
+                    )
+                })?;
+        }
         Ok(())
     }
 
@@ -787,6 +843,8 @@ impl RedisVddabRepository {
             .await?
             .unwrap_or_else(|| "active".to_owned());
         let workflow_id = self.read_hash_field(&key, "workflow_id").await?;
+        let forced_agent = self.read_hash_field(&key, "forced_agent").await?;
+        let forced_agent_reason = self.read_hash_field(&key, "forced_agent_reason").await?;
         Ok(Some(PersistedSessionMeta {
             session_id: session_id.to_owned(),
             workspace_id,
@@ -794,6 +852,8 @@ impl RedisVddabRepository {
             created_at,
             status,
             workflow_id,
+            forced_agent,
+            forced_agent_reason,
         }))
     }
 
