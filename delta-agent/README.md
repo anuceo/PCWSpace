@@ -92,6 +92,7 @@ Formal spec artifacts:
 
 - `docs/api-contract-v1.md`
 - `docs/openapi.v1.json`
+- `python3 scripts/check_openapi_sync.py` (runtime route/spec alignment check)
 
 ### Core endpoints
 
@@ -110,11 +111,14 @@ Formal spec artifacts:
 - `GET /api/v1/artifacts/{artifactId}/versions`
 - `GET /api/v1/artifacts/{artifactId}/versions/{version}`
 - `POST /api/v1/workflows/start`
+- `POST /api/v1/workflows/execute-next`
+- `POST /api/v1/workflows/notion/execute-next`
 - `GET /api/v1/workflows/{workflowId}/state`
 - `POST /api/v1/workflows/{workflowId}/step`
 - `POST /api/v1/sessions/{sessionId}/agent`
 - `GET /api/v1/sessions/{sessionId}/agents/logs`
 - `GET /api/v1/sessions/{sessionId}/trace`
+- `POST /api/v1/debug/sessions/{sessionId}/branches/{branchId}/audit`
 - `GET /api/v1/health`
 
 ### Authentication / authorization middleware

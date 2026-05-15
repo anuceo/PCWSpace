@@ -21,3 +21,6 @@ jobs:
       - name: Run tests
         working-directory: ./delta-agent
         run: cargo test --verbose
+      - name: Verify OpenAPI route sync
+        working-directory: ./delta-agent
+        run: python3 scripts/check_openapi_sync.py

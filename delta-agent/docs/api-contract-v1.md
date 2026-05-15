@@ -329,6 +329,7 @@ Force agent request:
 ## 7) System / debug API
 
 - `GET /sessions/{sessionId}/trace`
+- `POST /debug/sessions/{sessionId}/branches/{branchId}/audit`
 - `GET /health`
 
 Execution trace response shape:

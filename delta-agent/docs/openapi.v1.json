@@ -139,6 +139,32 @@
         }
       }
     },
+    "/api/v1/sessions/{sessionId}": {
+      "get": {
+        "summary": "Get session",
+        "operationId": "getSession",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionViewEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
     "/api/v1/sessions/{sessionId}/messages": {
       "post": {
         "summary": "Send message (primary deterministic entrypoint)",
@@ -473,13 +499,28 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/WorkflowExecutionResultEnvelope"
+                  "$ref": "#/components/schemas/ExecuteNextWorkflowEnvelope"
                 }
               }
             }
-          },
-          "404": {
-            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/workflows/notion/execute-next": {
+      "post": {
+        "summary": "Execute next notion sync job",
+        "operationId": "executeNextNotionJob",
+        "responses": {
+          "200": {
+            "description": "Notion sync execution result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecuteNextNotionEnvelope"
+                }
+              }
+            }
           }
         }
       }
@@ -793,6 +834,35 @@
         }
       }
     },
+    "/api/v1/debug/sessions/{sessionId}/branches/{branchId}/audit": {
+      "post": {
+        "summary": "Run branch audit",
+        "operationId": "runBranchAudit",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          },
+          {
+            "$ref": "#/components/parameters/branchId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Branch audit report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchAuditResponseEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
     "/api/v1/health": {
       "get": {
         "summary": "Health check",
@@ -848,6 +918,14 @@
       },
       "workflowId": {
         "name": "workflowId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "branchId": {
+        "name": "branchId",
         "in": "path",
         "required": true,
         "schema": {
@@ -1560,6 +1638,96 @@
           }
         }
       },
+      "NotionSyncExecutionResult": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "artifacts_count",
+          "summary_preview"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "artifacts_count": {
+            "type": "integer"
+          },
+          "summary_preview": {
+            "type": "string"
+          }
+        }
+      },
+      "VerificationResult": {
+        "type": "object",
+        "required": [
+          "valid",
+          "verified_count",
+          "failed_at",
+          "error"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean"
+          },
+          "verified_count": {
+            "type": "integer"
+          },
+          "failed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ReplayAuditResult": {
+        "type": "object",
+        "required": [
+          "valid",
+          "final_state_match",
+          "hash_match"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean"
+          },
+          "final_state_match": {
+            "type": "boolean"
+          },
+          "hash_match": {
+            "type": "boolean"
+          }
+        }
+      },
+      "BranchAuditResponse": {
+        "type": "object",
+        "required": [
+          "branch_id",
+          "valid",
+          "chain",
+          "replay"
+        ],
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          },
+          "valid": {
+            "type": "boolean"
+          },
+          "chain": {
+            "$ref": "#/components/schemas/VerificationResult"
+          },
+          "replay": {
+            "$ref": "#/components/schemas/ReplayAuditResult"
+          }
+        }
+      },
       "AgentSelectionView": {
         "type": "object",
         "required": [
@@ -2055,10 +2223,98 @@
           }
         ]
       },
+      "SessionViewEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SessionView"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "ExecuteNextWorkflowEnvelope": {
+        "type": "object",
+        "required": [
+          "executed",
+          "result",
+          "meta"
+        ],
+        "properties": {
+          "executed": {
+            "type": "boolean"
+          },
+          "result": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowExecutionResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ApiMeta"
+          }
+        }
+      },
+      "ExecuteNextNotionEnvelope": {
+        "type": "object",
+        "required": [
+          "executed",
+          "result",
+          "meta"
+        ],
+        "properties": {
+          "executed": {
+            "type": "boolean"
+          },
+          "result": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NotionSyncExecutionResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ApiMeta"
+          }
+        }
+      },
       "WorkflowExecutionResultEnvelope": {
         "allOf": [
           {
             "$ref": "#/components/schemas/WorkflowExecutionResult"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "BranchAuditResponseEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BranchAuditResponse"
           },
           {
             "type": "object",
