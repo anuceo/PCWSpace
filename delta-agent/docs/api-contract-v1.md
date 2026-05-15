@@ -308,6 +308,26 @@ If no job is available:
 }
 ```
 
+A Notion queue pull (`POST /workflows/notion/execute-next`) returns:
+
+```json
+{
+  "executed": true,
+  "result": {
+    "session_id": "sess_456",
+    "artifacts_count": 2,
+    "summary_preview": "Here is the generated update..."
+  },
+  "meta": {
+    "request_id": "req_123",
+    "timestamp": 1775453669005,
+    "latency_ms": 8
+  }
+}
+```
+
+Operational note: Notion outbound sync is integration-gated at runtime (`NOTION_SYNC_ENABLED=true` plus token/parent configuration). When disabled or incomplete, the job is still consumed and logged to keep queue flow deterministic.
+
 ---
 
 ## 6) Agent control API

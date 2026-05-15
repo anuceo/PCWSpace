@@ -12,6 +12,10 @@ pub struct WorkerConfig {
     pub api_base_url: String,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    #[serde(default = "default_notion_poll_enabled")]
+    pub notion_poll_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -30,4 +34,12 @@ pub fn load(path: impl AsRef<Path>) -> anyhow::Result<WorkerConfig> {
 
 fn default_api_base_url() -> String {
     "http://127.0.0.1:8080".to_owned()
+}
+
+fn default_request_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_notion_poll_enabled() -> bool {
+    true
 }

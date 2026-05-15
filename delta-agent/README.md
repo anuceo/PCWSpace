@@ -108,6 +108,7 @@ Formal spec artifacts:
 
 - `docs/api-contract-v1.md`
 - `docs/openapi.v1.json`
+- `docs/deployment-profiles.md`
 - `python3 scripts/check_openapi_sync.py` (runtime route/spec alignment check)
 
 ### Core endpoints
@@ -211,3 +212,13 @@ stabilize cloud-agent runs for this workspace:
 - uses stable Rust with `rustfmt` and `clippy`
 - prewarms `cargo check --workspace` + `cargo test --workspace --no-run`
 - persists Cargo/Rust caches and a shared Cargo target directory
+
+## Production hardening notes
+
+- `configs/default.toml` now maps directly to runtime sections used by server/worker:
+  - `[runtime]`, `[persistence]`, `[auth]`, `[agents]`, `[notion]`, `[worker]`
+- server bootstrap applies config-driven env defaults before pipeline startup
+- Notion sync execution now supports optional outbound Notion API writes with retry:
+  - enable with `NOTION_SYNC_ENABLED=true`
+  - configure either `NOTION_DATABASE_ID` or `NOTION_PARENT_PAGE_ID`
+  - retries bounded by `NOTION_SYNC_MAX_ATTEMPTS`

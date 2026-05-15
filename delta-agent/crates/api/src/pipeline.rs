@@ -43,6 +43,10 @@ const LOCK_RETRY_DELAY_MS: u64 = 40;
 const STREAM_IDEMPOTENCY_TTL_SECS: u64 = 60 * 60;
 const EVENT_TYPE_EXECUTION_STEP: &str = "EXECUTION_STEP";
 const MAIN_BRANCH_ID: &str = "br_main";
+const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com/v1";
+const DEFAULT_NOTION_API_VERSION: &str = "2022-06-28";
+const DEFAULT_NOTION_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_NOTION_MAX_ATTEMPTS: u32 = 3;
 
 static PIPELINE: OnceLock<ExecutionPipeline> = OnceLock::new();
 
@@ -687,6 +691,57 @@ struct NotionSyncJob {
     attempt: u32,
 }
 
+#[derive(Debug, Clone)]
+struct NotionSyncConfig {
+    enabled: bool,
+    api_base_url: String,
+    api_version: String,
+    token: Option<String>,
+    database_id: Option<String>,
+    parent_page_id: Option<String>,
+    title_property: String,
+    timeout_ms: u64,
+    max_attempts: u32,
+}
+
+impl NotionSyncConfig {
+    fn from_env() -> Self {
+        let enabled = read_bool_env("NOTION_SYNC_ENABLED", false);
+        let api_base_url = read_string_env("NOTION_API_BASE_URL")
+            .unwrap_or_else(|| DEFAULT_NOTION_API_BASE_URL.to_owned());
+        let api_version = read_string_env("NOTION_API_VERSION")
+            .unwrap_or_else(|| DEFAULT_NOTION_API_VERSION.to_owned());
+        let token = read_string_env("NOTION_TOKEN");
+        let database_id = read_string_env("NOTION_DATABASE_ID");
+        let parent_page_id = read_string_env("NOTION_PARENT_PAGE_ID");
+        let title_property =
+            read_string_env("NOTION_DATABASE_TITLE_PROPERTY").unwrap_or_else(|| "Name".to_owned());
+        let timeout_ms = read_u64_env("NOTION_TIMEOUT_MS", DEFAULT_NOTION_TIMEOUT_MS);
+        let max_attempts = read_u32_env("NOTION_SYNC_MAX_ATTEMPTS", DEFAULT_NOTION_MAX_ATTEMPTS);
+        Self {
+            enabled,
+            api_base_url,
+            api_version,
+            token,
+            database_id,
+            parent_page_id,
+            title_property,
+            timeout_ms,
+            max_attempts: max_attempts.max(1),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if self.token.is_none() {
+            return false;
+        }
+        self.database_id.is_some() || self.parent_page_id.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum WorkflowJobSource {
     Durable,
@@ -748,6 +803,8 @@ struct ArtifactWriteOutcome {
 #[derive(Debug)]
 pub struct ExecutionPipeline {
     agent_runtime_config: AgentRuntimeConfig,
+    notion_sync_config: NotionSyncConfig,
+    notion_http_client: reqwest::Client,
     keyspace: RedisKeyspace,
     persistence: Option<PersistenceConfig>,
     id_counter: AtomicU64,
@@ -777,9 +834,18 @@ impl ExecutionPipeline {
             .map_err(|err| PipelineError::InvalidInput(format!("invalid env segment: {err}")))?;
         validate_spec_integrity()
             .map_err(|err| PipelineError::InvalidInput(format!("invalid key spec: {err}")))?;
+        let notion_sync_config = NotionSyncConfig::from_env();
+        let notion_http_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(notion_sync_config.timeout_ms))
+            .build()
+            .map_err(|err| {
+                PipelineError::Internal(format!("notion HTTP client setup failed: {err}"))
+            })?;
 
         Ok(Self {
             agent_runtime_config: AgentRuntimeConfig::from_env(),
+            notion_sync_config,
+            notion_http_client,
             keyspace,
             persistence: load_persistence_config(),
             id_counter: AtomicU64::new(1),
@@ -1608,10 +1674,20 @@ impl ExecutionPipeline {
         &self,
     ) -> Result<Option<NotionSyncExecutionResult>, PipelineError> {
         self.ensure_persistence_hydrated().await;
-        let (next_job, _source) = self.next_notion_sync_job().await;
+        let (next_job, source) = self.next_notion_sync_job().await;
         let Some(job) = next_job else {
             return Ok(None);
         };
+
+        if let Err(error) = self.perform_notion_sync(&job).await {
+            warn!(
+                session_id = %job.session_id,
+                attempt = job.attempt,
+                error = %error,
+                "notion sync execution failed"
+            );
+            self.requeue_notion_sync_job(job.clone(), source).await;
+        }
 
         let preview = job.summary.chars().take(140).collect::<String>();
         info!(
@@ -1626,6 +1702,118 @@ impl ExecutionPipeline {
             artifacts_count: job.artifacts.len(),
             summary_preview: preview,
         }))
+    }
+
+    async fn perform_notion_sync(&self, job: &NotionSyncJob) -> Result<(), PipelineError> {
+        if !self.notion_sync_config.is_active() {
+            info!(
+                session_id = %job.session_id,
+                "notion sync skipped because integration is not configured"
+            );
+            return Ok(());
+        }
+
+        let Some(token) = self.notion_sync_config.token.as_ref() else {
+            return Ok(());
+        };
+
+        let mut properties = serde_json::Map::new();
+        let title = format!("Delta Agent Sync {}", job.session_id);
+        let title_property = if self.notion_sync_config.parent_page_id.is_some() {
+            "title".to_owned()
+        } else {
+            self.notion_sync_config.title_property.clone()
+        };
+        properties.insert(title_property, notion_title_property(&title));
+
+        let parent = if let Some(parent_page_id) = self.notion_sync_config.parent_page_id.as_ref() {
+            serde_json::json!({ "page_id": parent_page_id })
+        } else if let Some(database_id) = self.notion_sync_config.database_id.as_ref() {
+            serde_json::json!({ "database_id": database_id })
+        } else {
+            return Ok(());
+        };
+
+        let summary_preview = truncate_for_notion(&job.summary, 1800);
+        let artifacts_line = if job.artifacts.is_empty() {
+            "Artifacts: none".to_owned()
+        } else {
+            format!(
+                "Artifacts: {}",
+                truncate_for_notion(&job.artifacts.join(", "), 1800)
+            )
+        };
+        let timestamp_line = format!("Queued at: {}", job.timestamp_ms);
+        let body = serde_json::json!({
+            "parent": parent,
+            "properties": properties,
+            "children": [
+                notion_paragraph_block(&format!("Session: {}", job.session_id)),
+                notion_paragraph_block(&timestamp_line),
+                notion_paragraph_block(&artifacts_line),
+                notion_paragraph_block(&format!("Summary: {}", summary_preview)),
+            ],
+        });
+
+        let endpoint = format!(
+            "{}/pages",
+            self.notion_sync_config.api_base_url.trim_end_matches('/')
+        );
+        let response = self
+            .notion_http_client
+            .post(&endpoint)
+            .bearer_auth(token)
+            .header(
+                "Notion-Version",
+                self.notion_sync_config.api_version.as_str(),
+            )
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| PipelineError::Internal(format!("notion request failed: {err}")))?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        let raw = response.text().await.unwrap_or_default();
+        Err(PipelineError::Internal(format!(
+            "notion returned status {}: {}",
+            status,
+            truncate_for_notion(&raw, 400)
+        )))
+    }
+
+    async fn requeue_notion_sync_job(&self, mut job: NotionSyncJob, source: WorkflowJobSource) {
+        job.attempt += 1;
+        if job.attempt >= self.notion_sync_config.max_attempts {
+            warn!(
+                session_id = %job.session_id,
+                attempt = job.attempt,
+                max_attempts = self.notion_sync_config.max_attempts,
+                "dropping notion sync job after reaching max retry attempts"
+            );
+            return;
+        }
+
+        if self.enqueue_notion_sync_durable(&job).await {
+            info!(
+                session_id = %job.session_id,
+                attempt = job.attempt,
+                "requeued notion sync job in durable queue"
+            );
+            return;
+        }
+
+        let mut queue = self.notion_queue.lock().await;
+        queue.push(job.clone());
+        info!(
+            session_id = %job.session_id,
+            attempt = job.attempt,
+            source = ?source,
+            "requeued notion sync job in memory queue"
+        );
     }
 
     pub async fn force_agent_selection(
@@ -4135,6 +4323,68 @@ fn load_persistence_config() -> Option<PersistenceConfig> {
         redis_url,
         vddab_root,
     })
+}
+
+fn read_string_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_bool_env(key: &str, default: bool) -> bool {
+    let Some(raw) = std::env::var(key).ok() else {
+        return default;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+fn read_u64_env(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn read_u32_env(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn notion_title_property(title: &str) -> Value {
+    serde_json::json!({
+        "title": [{
+            "type": "text",
+            "text": {
+                "content": truncate_for_notion(title, 1800)
+            }
+        }]
+    })
+}
+
+fn notion_paragraph_block(content: &str) -> Value {
+    serde_json::json!({
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {
+            "rich_text": [{
+                "type": "text",
+                "text": {
+                    "content": truncate_for_notion(content, 1800)
+                }
+            }]
+        }
+    })
+}
+
+fn truncate_for_notion(input: &str, max_chars: usize) -> String {
+    input.chars().take(max_chars).collect::<String>()
 }
 
 fn compress_ops(payload: &[u8]) -> Vec<u8> {

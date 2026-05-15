@@ -9,7 +9,7 @@ use crate::config::WorkerConfig;
 pub async fn run(config: WorkerConfig) {
     init_tracing();
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_millis(config.request_timeout_ms))
         .build()
     {
         Ok(client) => client,
@@ -23,6 +23,8 @@ pub async fn run(config: WorkerConfig) {
         max_concurrency = config.max_concurrency,
         poll_interval_ms = config.poll_interval_ms,
         api_base_url = %config.api_base_url,
+        notion_poll_enabled = config.notion_poll_enabled,
+        request_timeout_ms = config.request_timeout_ms,
         "worker starting"
     );
 
@@ -47,19 +49,23 @@ pub async fn run(config: WorkerConfig) {
                 }
             }
         }
-        let notion_executed = match execute_next(
-            &client,
-            &config.api_base_url,
-            "/api/v1/workflows/notion/execute-next",
-            &headers,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(error = %error, "notion execution poll failed");
-                false
+        let notion_executed = if config.notion_poll_enabled {
+            match execute_next(
+                &client,
+                &config.api_base_url,
+                "/api/v1/workflows/notion/execute-next",
+                &headers,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(error = %error, "notion execution poll failed");
+                    false
+                }
             }
+        } else {
+            false
         };
         info!(
             workflow_executed,

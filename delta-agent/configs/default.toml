@@ -2,17 +2,43 @@
 host = "0.0.0.0"
 port = 8080
 
+[runtime]
+env = "prod"
+
+[persistence]
+# Set redis_url to enable durable persistence/locks/idempotency.
+redis_url = ""
+vddab_root = "./data/vddab"
+
+[auth]
+required = false
+disabled = false
+writer_keys = []
+reader_keys = []
+admin_keys = []
+
+[agents]
+use_real_agents = false
+anthropic_api_key = ""
+anthropic_model = "claude-sonnet-4-6"
+deepseek_api_key = ""
+deepseek_model = "deepseek-chat"
+
+[notion]
+enabled = false
+token = ""
+database_id = ""
+parent_page_id = ""
+title_property = "Name"
+api_base_url = "https://api.notion.com/v1"
+api_version = "2022-06-28"
+timeout_ms = 10000
+max_attempts = 3
+
 [worker]
 max_concurrency = 8
 poll_interval_ms = 100
 api_base_url = "http://127.0.0.1:8080"
 # api_key = "set-via-env-or-config"
-
-[storage]
-root = "./data"
-
-[streaming]
-buffer_capacity = 1024
-
-[compression]
-default_tier = "balanced"
+request_timeout_ms = 30000
+notion_poll_enabled = true
