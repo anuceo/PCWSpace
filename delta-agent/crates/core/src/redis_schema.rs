@@ -168,6 +168,13 @@ const KEY_SPECS: &[KeySpec] = &[
         notes: "Agent task queue stream",
     },
     KeySpec {
+        key_name: "stream_idempotency",
+        template: "{env}:idempotency:stream:{sessionId}:{requestKey}",
+        primitive: RedisPrimitive::String,
+        retention: RetentionClass::ShortLived,
+        notes: "Cached SSE idempotent response payload",
+    },
+    KeySpec {
         key_name: "session_agent_responses",
         template: "{env}:session:{sessionId}:agent_responses",
         primitive: RedisPrimitive::Stream,
@@ -572,6 +579,16 @@ impl RedisKeyspace {
         self.compose(&["queue", "agent"])
     }
 
+    pub fn stream_idempotency(
+        &self,
+        session_id: &str,
+        request_key: &str,
+    ) -> Result<String, CoreError> {
+        self.validate_id("session_id", session_id)?;
+        self.validate_id("request_key", request_key)?;
+        Ok(self.compose(&["idempotency", "stream", session_id, request_key]))
+    }
+
     pub fn branch_priority_queue(&self) -> String {
         self.compose(&["queue", "branch_priority"])
     }
@@ -823,6 +840,9 @@ mod tests {
         assert!(key_specs()
             .iter()
             .any(|spec| spec.key_name == "session_active_branch"));
+        assert!(key_specs()
+            .iter()
+            .any(|spec| spec.key_name == "stream_idempotency"));
         assert!(key_specs()
             .iter()
             .any(|spec| spec.key_name == "branch_state"));

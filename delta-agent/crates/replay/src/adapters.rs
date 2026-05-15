@@ -5,6 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use delta_core::redis_schema::RedisKeyspace;
 use deltashot::{DeltaShot, Metadata, Op};
 use redis::aio::ConnectionManager;
+use redis::Script;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1038,6 +1039,67 @@ impl RedisVddabRepository {
             .with_context(|| format!("failed to load session artifacts '{}'", session_id))?;
         artifact_ids.sort();
         Ok(artifact_ids)
+    }
+
+    pub async fn try_acquire_distributed_lock(
+        &self,
+        lock_key: &str,
+        owner: &str,
+        ttl_secs: u64,
+    ) -> Result<bool> {
+        let mut conn = self.redis.clone();
+        let reply: Option<String> = redis::cmd("SET")
+            .arg(lock_key)
+            .arg(owner)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to acquire distributed lock '{}'", lock_key))?;
+        Ok(reply.is_some())
+    }
+
+    pub async fn release_distributed_lock(&self, lock_key: &str, owner: &str) -> Result<()> {
+        let mut conn = self.redis.clone();
+        let script = Script::new(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+        );
+        let _: i64 = script
+            .key(lock_key)
+            .arg(owner)
+            .invoke_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to release distributed lock '{}'", lock_key))?;
+        Ok(())
+    }
+
+    pub async fn store_idempotency_payload(
+        &self,
+        key: &str,
+        payload: &str,
+        ttl_secs: u64,
+    ) -> Result<()> {
+        let mut conn = self.redis.clone();
+        let _: String = redis::cmd("SET")
+            .arg(key)
+            .arg(payload)
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to store idempotency payload '{}'", key))?;
+        Ok(())
+    }
+
+    pub async fn load_idempotency_payload(&self, key: &str) -> Result<Option<String>> {
+        let mut conn = self.redis.clone();
+        let payload: Option<String> = redis::cmd("GET")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to load idempotency payload '{}'", key))?;
+        Ok(payload)
     }
 
     pub async fn append_session_message(

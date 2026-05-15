@@ -40,6 +40,7 @@ const RECENT_MESSAGE_WINDOW: usize = 20;
 const SESSION_LOCK_TTL_SECS: u64 = 5;
 const SESSION_LOCK_RETRIES: usize = 3;
 const LOCK_RETRY_DELAY_MS: u64 = 40;
+const STREAM_IDEMPOTENCY_TTL_SECS: u64 = 60 * 60;
 const EVENT_TYPE_EXECUTION_STEP: &str = "EXECUTION_STEP";
 const MAIN_BRANCH_ID: &str = "br_main";
 
@@ -449,7 +450,7 @@ pub struct BranchMergeResponse {
     pub new_deltashot_id: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamEventEnvelope {
     pub event: String,
     pub data: Value,
@@ -692,6 +693,19 @@ enum WorkflowJobSource {
     InMemory,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SessionLockBackend {
+    Distributed,
+    InMemory,
+}
+
+#[derive(Debug, Clone)]
+struct SessionLockHandle {
+    key: String,
+    owner: String,
+    backend: SessionLockBackend,
+}
+
 #[derive(Debug, Clone)]
 struct ForcedAgent {
     agent: String,
@@ -746,7 +760,7 @@ pub struct ExecutionPipeline {
     workflow_queue: Mutex<Vec<WorkflowJob>>,
     agent_logs: RwLock<HashMap<String, Vec<AgentLogEntry>>>,
     notion_queue: Mutex<Vec<NotionSyncJob>>,
-    locks: Mutex<HashMap<String, Instant>>,
+    locks: Mutex<HashMap<String, (String, Instant)>>,
     idempotent_streams: Mutex<HashMap<String, Vec<StreamEventEnvelope>>>,
     persistence_hydration: TokioOnceCell<()>,
 }
@@ -979,16 +993,16 @@ impl ExecutionPipeline {
 
         self.record_execution_step(session_id, "SESSION_HYDRATE_START", Value::Null)
             .await?;
-        let lock_key = self.acquire_session_lock(session_id).await?;
+        let lock_handle = self.acquire_session_lock(session_id).await?;
         self.record_execution_step(
             session_id,
             "LOCK_ACQUIRED",
-            serde_json::json!({ "lock_key": lock_key.clone() }),
+            serde_json::json!({ "lock_key": lock_handle.key.clone() }),
         )
         .await?;
 
         let result = self.run_locked_message_pipeline(session_id, request).await;
-        self.release_lock(&lock_key).await;
+        self.release_lock(&lock_handle).await;
         let _ = self
             .record_execution_step(session_id, "LOCK_RELEASED", Value::Null)
             .await;
@@ -1326,7 +1340,7 @@ impl ExecutionPipeline {
         request: RollbackRequest,
     ) -> Result<RollbackResponse, PipelineError> {
         self.ensure_persistence_hydrated().await;
-        let lock_key = self.acquire_session_lock(session_id).await?;
+        let lock_handle = self.acquire_session_lock(session_id).await?;
 
         let result = async {
             let target_id = request.target_deltashot_id.clone();
@@ -1409,7 +1423,7 @@ impl ExecutionPipeline {
         }
         .await;
 
-        self.release_lock(&lock_key).await;
+        self.release_lock(&lock_handle).await;
         result
     }
 
@@ -2667,10 +2681,9 @@ impl ExecutionPipeline {
         self.ensure_persistence_hydrated().await;
         let cache_key = idempotency_key
             .as_ref()
-            .map(|key| format!("{session_id}:{key}"));
+            .and_then(|key| self.stream_idempotency_storage_key(session_id, key));
         if let Some(key) = cache_key.as_ref() {
-            let cache = self.idempotent_streams.lock().await;
-            if let Some(cached) = cache.get(key) {
+            if let Some(cached) = self.load_cached_stream_events(key).await {
                 return cached.clone();
             }
         }
@@ -2690,9 +2703,8 @@ impl ExecutionPipeline {
                     retryable: false,
                 },
             ));
-            if let Some(key) = cache_key {
-                let mut cache = self.idempotent_streams.lock().await;
-                cache.insert(key, events.clone());
+            if let Some(key) = cache_key.as_ref() {
+                self.store_cached_stream_events(key, &events).await;
             }
             return events;
         }
@@ -2709,15 +2721,14 @@ impl ExecutionPipeline {
                         retryable: error.retryable(),
                     },
                 ));
-                if let Some(key) = cache_key {
-                    let mut cache = self.idempotent_streams.lock().await;
-                    cache.insert(key, events.clone());
+                if let Some(key) = cache_key.as_ref() {
+                    self.store_cached_stream_events(key, &events).await;
                 }
                 return events;
             }
         }
 
-        let lock_key = match self.acquire_session_lock(session_id).await {
+        let lock_handle = match self.acquire_session_lock(session_id).await {
             Ok(key) => key,
             Err(error) => {
                 events.push(stream_event(
@@ -2727,9 +2738,8 @@ impl ExecutionPipeline {
                         retryable: error.retryable(),
                     },
                 ));
-                if let Some(key) = cache_key {
-                    let mut cache = self.idempotent_streams.lock().await;
-                    cache.insert(key, events.clone());
+                if let Some(key) = cache_key.as_ref() {
+                    self.store_cached_stream_events(key, &events).await;
                 }
                 return events;
             }
@@ -2738,7 +2748,7 @@ impl ExecutionPipeline {
         let result = self
             .run_locked_stream_pipeline(session_id, request, &mut events)
             .await;
-        self.release_lock(&lock_key).await;
+        self.release_lock(&lock_handle).await;
 
         match result {
             Ok(_) => events.push(stream_event(
@@ -2756,9 +2766,8 @@ impl ExecutionPipeline {
             )),
         }
 
-        if let Some(key) = cache_key {
-            let mut cache = self.idempotent_streams.lock().await;
-            cache.insert(key, events.clone());
+        if let Some(key) = cache_key.as_ref() {
+            self.store_cached_stream_events(key, &events).await;
         }
         events
     }
@@ -3027,40 +3036,154 @@ impl ExecutionPipeline {
         }
     }
 
-    async fn acquire_session_lock(&self, session_id: &str) -> Result<String, PipelineError> {
+    async fn acquire_session_lock(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionLockHandle, PipelineError> {
         let lock_key = self
             .keyspace
             .lock_session(session_id)
             .map_err(|err| PipelineError::InvalidInput(err.to_string()))?;
+        let owner = format!("lock_{}", uuid::Uuid::new_v4().simple());
 
         for _ in 0..SESSION_LOCK_RETRIES {
-            if self.try_acquire_lock(&lock_key).await {
-                return Ok(lock_key);
+            if let Some(backend) = self.try_acquire_lock(&lock_key, &owner).await {
+                return Ok(SessionLockHandle {
+                    key: lock_key.clone(),
+                    owner: owner.clone(),
+                    backend,
+                });
             }
             tokio::time::sleep(Duration::from_millis(LOCK_RETRY_DELAY_MS)).await;
         }
         Err(PipelineError::LockUnavailable)
     }
 
-    async fn try_acquire_lock(&self, lock_key: &str) -> bool {
+    async fn try_acquire_lock(&self, lock_key: &str, owner: &str) -> Option<SessionLockBackend> {
+        if let Some(repo) = self.persistence_backend().await {
+            match repo
+                .try_acquire_distributed_lock(lock_key, owner, SESSION_LOCK_TTL_SECS)
+                .await
+            {
+                Ok(true) => return Some(SessionLockBackend::Distributed),
+                Ok(false) => return None,
+                Err(err) => {
+                    warn!(
+                        lock_key = %lock_key,
+                        error = %err,
+                        "distributed lock acquisition failed, falling back to in-memory lock"
+                    );
+                }
+            }
+        }
+
         let mut locks = self.locks.lock().await;
         let now = Instant::now();
-        locks.retain(|_, expires_at| *expires_at > now);
+        locks.retain(|_, (_, expires_at)| *expires_at > now);
 
         if locks.contains_key(lock_key) {
-            return false;
+            return None;
         }
 
         locks.insert(
             lock_key.to_owned(),
-            now + Duration::from_secs(SESSION_LOCK_TTL_SECS),
+            (
+                owner.to_owned(),
+                now + Duration::from_secs(SESSION_LOCK_TTL_SECS),
+            ),
         );
-        true
+        Some(SessionLockBackend::InMemory)
     }
 
-    async fn release_lock(&self, lock_key: &str) {
-        let mut locks = self.locks.lock().await;
-        locks.remove(lock_key);
+    async fn release_lock(&self, handle: &SessionLockHandle) {
+        match handle.backend {
+            SessionLockBackend::Distributed => {
+                if let Some(repo) = self.persistence_backend().await {
+                    if let Err(err) = repo
+                        .release_distributed_lock(&handle.key, &handle.owner)
+                        .await
+                    {
+                        warn!(
+                            lock_key = %handle.key,
+                            error = %err,
+                            "failed to release distributed lock"
+                        );
+                    }
+                }
+            }
+            SessionLockBackend::InMemory => {
+                let mut locks = self.locks.lock().await;
+                if let Some((current_owner, _)) = locks.get(&handle.key) {
+                    if current_owner == &handle.owner {
+                        locks.remove(&handle.key);
+                    }
+                }
+            }
+        }
+    }
+
+    fn stream_idempotency_storage_key(
+        &self,
+        session_id: &str,
+        idempotency_key: &str,
+    ) -> Option<String> {
+        let digest = blake3::hash(idempotency_key.as_bytes())
+            .to_hex()
+            .chars()
+            .take(32)
+            .collect::<String>();
+        self.keyspace.stream_idempotency(session_id, &digest).ok()
+    }
+
+    async fn load_cached_stream_events(&self, cache_key: &str) -> Option<Vec<StreamEventEnvelope>> {
+        {
+            let cache = self.idempotent_streams.lock().await;
+            if let Some(cached) = cache.get(cache_key) {
+                return Some(cached.clone());
+            }
+        }
+
+        let repo = self.persistence_backend().await?;
+        let payload = match repo.load_idempotency_payload(cache_key).await {
+            Ok(value) => value?,
+            Err(err) => {
+                warn!(cache_key = %cache_key, error = %err, "failed to load idempotent stream cache");
+                return None;
+            }
+        };
+        let cached = match serde_json::from_str::<Vec<StreamEventEnvelope>>(&payload) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                warn!(cache_key = %cache_key, error = %err, "invalid idempotent stream payload");
+                return None;
+            }
+        };
+        let mut cache = self.idempotent_streams.lock().await;
+        cache.insert(cache_key.to_owned(), cached.clone());
+        Some(cached)
+    }
+
+    async fn store_cached_stream_events(&self, cache_key: &str, events: &[StreamEventEnvelope]) {
+        {
+            let mut cache = self.idempotent_streams.lock().await;
+            cache.insert(cache_key.to_owned(), events.to_vec());
+        }
+        let Some(repo) = self.persistence_backend().await else {
+            return;
+        };
+        let payload = match serde_json::to_string(events) {
+            Ok(payload) => payload,
+            Err(err) => {
+                warn!(cache_key = %cache_key, error = %err, "failed to serialize idempotent stream cache");
+                return;
+            }
+        };
+        if let Err(err) = repo
+            .store_idempotency_payload(cache_key, &payload, STREAM_IDEMPOTENCY_TTL_SECS)
+            .await
+        {
+            warn!(cache_key = %cache_key, error = %err, "failed to persist idempotent stream cache");
+        }
     }
 
     async fn append_message(
