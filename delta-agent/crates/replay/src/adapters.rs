@@ -10,9 +10,13 @@ use redis::Script;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 use vddab::{deltashot_store::DeltaShotStore, snapshot_store::SnapshotStore};
 
 use crate::verifier::{decompress_ops, DeltaRepository, StateRepository};
+
+const DEFAULT_QUEUE_RECLAIM_IDLE_MS: usize = 60_000;
+const DEFAULT_QUEUE_RECLAIM_COUNT: usize = 1;
 
 #[derive(Clone)]
 pub struct RedisVddabRepository {
@@ -21,6 +25,8 @@ pub struct RedisVddabRepository {
     deltashot_store: DeltaShotStore,
     snapshot_store: SnapshotStore,
     consumer_name: String,
+    queue_reclaim_idle_ms: usize,
+    queue_reclaim_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +144,15 @@ impl RedisVddabRepository {
             deltashot_store: DeltaShotStore::new(root.clone()),
             snapshot_store: SnapshotStore::new(root),
             consumer_name: build_consumer_name(),
+            queue_reclaim_idle_ms: read_env_usize(
+                "DELTA_AGENT_QUEUE_RECLAIM_IDLE_MS",
+                DEFAULT_QUEUE_RECLAIM_IDLE_MS,
+            ),
+            queue_reclaim_count: read_env_usize(
+                "DELTA_AGENT_QUEUE_RECLAIM_COUNT",
+                DEFAULT_QUEUE_RECLAIM_COUNT,
+            )
+            .max(1),
         })
     }
 
@@ -1338,6 +1353,44 @@ impl RedisVddabRepository {
     ) -> Result<Option<(String, T)>> {
         self.ensure_stream_group(key, group).await?;
         let mut conn = self.redis.clone();
+
+        let reclaimed_result: std::result::Result<
+            redis::streams::StreamAutoClaimReply,
+            redis::RedisError,
+        > = redis::cmd("XAUTOCLAIM")
+            .arg(key)
+            .arg(group)
+            .arg(&self.consumer_name)
+            .arg(self.queue_reclaim_idle_ms)
+            .arg("0-0")
+            .arg(redis::streams::StreamAutoClaimOptions::default().count(self.queue_reclaim_count))
+            .query_async(&mut conn)
+            .await;
+        match reclaimed_result {
+            Ok(reclaimed) => {
+                if let Some(item) = decode_stream_ids::<T>(reclaimed.claimed)? {
+                    return Ok(Some(item));
+                }
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if message.contains("unknown command") || message.contains("ERR unknown command") {
+                    warn!(
+                        stream_key = %key,
+                        consumer_group = %group,
+                        "XAUTOCLAIM unsupported by redis server; skipping stale-pending reclaim"
+                    );
+                } else {
+                    return Err(anyhow!(err)).with_context(|| {
+                        format!(
+                            "failed to reclaim stale pending payload for key '{}' group '{}'",
+                            key, group
+                        )
+                    });
+                }
+            }
+        }
+
         let pending: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg(group)
@@ -1408,16 +1461,25 @@ fn decode_stream_read_reply<T: DeserializeOwned>(
     reply: redis::streams::StreamReadReply,
 ) -> Result<Option<(String, T)>> {
     for stream_key in reply.keys {
-        for entry in stream_key.ids {
-            if let Some(payload) = entry
-                .map
-                .get("payload")
-                .and_then(|value| redis::from_redis_value::<String>(value).ok())
-            {
-                let decoded = serde_json::from_str::<T>(&payload)
-                    .context("invalid stream payload in consumer group read")?;
-                return Ok(Some((entry.id, decoded)));
-            }
+        if let Some(item) = decode_stream_ids::<T>(stream_key.ids)? {
+            return Ok(Some(item));
+        }
+    }
+    Ok(None)
+}
+
+fn decode_stream_ids<T: DeserializeOwned>(
+    entries: Vec<redis::streams::StreamId>,
+) -> Result<Option<(String, T)>> {
+    for entry in entries {
+        if let Some(payload) = entry
+            .map
+            .get("payload")
+            .and_then(|value| redis::from_redis_value::<String>(value).ok())
+        {
+            let decoded =
+                serde_json::from_str::<T>(&payload).context("invalid stream payload decoding")?;
+            return Ok(Some((entry.id, decoded)));
         }
     }
     Ok(None)
@@ -1426,6 +1488,13 @@ fn decode_stream_read_reply<T: DeserializeOwned>(
 fn build_consumer_name() -> String {
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "node".to_owned());
     format!("{hostname}-{}", process::id())
+}
+
+fn read_env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 impl DeltaRepository for RedisVddabRepository {
