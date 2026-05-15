@@ -16,8 +16,9 @@ use futures_util::StreamExt;
 use replay::{
     adapters::{
         DurableNotionSyncJob, DurableWorkflowJob, PersistedArtifactRecord,
-        PersistedArtifactVersion, PersistedSessionMeta, PersistedWorkflowRecord,
-        PersistedWorkspaceRecord, RedisVddabRepository,
+        PersistedArtifactVersion, PersistedSessionEvent, PersistedSessionMessage,
+        PersistedSessionMeta, PersistedWorkflowRecord, PersistedWorkspaceRecord,
+        RedisVddabRepository,
     },
     verifier::{audit_replay, verify_chain, ReplayAuditResult, VerificationResult},
     verifier::{DeltaRepository, StateRepository},
@@ -1835,6 +1836,50 @@ impl ExecutionPipeline {
                 session.status = meta.status;
                 session.workflow_id = meta.workflow_id;
             }
+            let persisted_messages = match repo.load_session_messages(&session_id).await {
+                Ok(messages) => messages
+                    .into_iter()
+                    .map(|message| {
+                        update_max_id_seed(&mut max_id, &message.id);
+                        ChatMessage {
+                            id: message.id,
+                            role: message.role,
+                            content: message.content,
+                            timestamp: message.timestamp,
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                Err(err) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %err,
+                        "failed to hydrate session messages"
+                    );
+                    Vec::new()
+                }
+            };
+            let persisted_events = match repo.load_session_events(&session_id).await {
+                Ok(events) => events
+                    .into_iter()
+                    .map(|event| {
+                        update_max_id_seed(&mut max_id, &event.id);
+                        SessionEvent {
+                            id: event.id,
+                            event_type: event.event_type,
+                            payload: event.payload,
+                            timestamp: event.timestamp,
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                Err(err) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %err,
+                        "failed to hydrate session events"
+                    );
+                    Vec::new()
+                }
+            };
 
             for branch_id in branch_ids {
                 update_max_id_seed(&mut max_id, &branch_id);
@@ -1911,6 +1956,9 @@ impl ExecutionPipeline {
                 session.active_branch_id = MAIN_BRANCH_ID.to_owned();
                 let _ = load_branch_into_session(&mut session, MAIN_BRANCH_ID);
             }
+            session.messages = persisted_messages;
+            session.events = persisted_events;
+            sync_active_branch_from_session(&mut session);
             if let Ok(artifact_ids) = repo.list_session_artifacts(&session_id).await {
                 for artifact_id in artifact_ids {
                     update_max_id_seed(&mut max_id, &artifact_id);
@@ -2207,6 +2255,51 @@ impl ExecutionPipeline {
                     session_id = %session.session_id,
                     error = %err,
                     "failed to persist session metadata"
+                );
+            }
+        }
+    }
+
+    async fn persist_session_message(
+        &self,
+        session_id: &str,
+        branch_id: &str,
+        message: &ChatMessage,
+    ) {
+        if let Some(repo) = self.persistence_backend().await {
+            let persisted = PersistedSessionMessage {
+                id: message.id.clone(),
+                branch_id: branch_id.to_owned(),
+                role: message.role.clone(),
+                content: message.content.clone(),
+                timestamp: message.timestamp,
+            };
+            if let Err(err) = repo.append_session_message(session_id, &persisted).await {
+                warn!(
+                    session_id = %session_id,
+                    message_id = %message.id,
+                    error = %err,
+                    "failed to persist session message"
+                );
+            }
+        }
+    }
+
+    async fn persist_session_event(&self, session_id: &str, branch_id: &str, event: &SessionEvent) {
+        if let Some(repo) = self.persistence_backend().await {
+            let persisted = PersistedSessionEvent {
+                id: event.id.clone(),
+                branch_id: branch_id.to_owned(),
+                event_type: event.event_type.clone(),
+                payload: event.payload.clone(),
+                timestamp: event.timestamp,
+            };
+            if let Err(err) = repo.append_session_event(session_id, &persisted).await {
+                warn!(
+                    session_id = %session_id,
+                    event_id = %event.id,
+                    error = %err,
+                    "failed to persist session event"
                 );
             }
         }
@@ -2992,8 +3085,12 @@ impl ExecutionPipeline {
             )
         });
         ensure_session_branches(session);
+        let branch_id = session.active_branch_id.clone();
         session.messages.push(message.clone());
         sync_active_branch_from_session(session);
+        drop(sessions);
+        self.persist_session_message(session_id, &branch_id, &message)
+            .await;
 
         Ok(message)
     }
@@ -3020,8 +3117,12 @@ impl ExecutionPipeline {
             )
         });
         ensure_session_branches(session);
+        let branch_id = session.active_branch_id.clone();
         session.events.push(event.clone());
         sync_active_branch_from_session(session);
+        drop(sessions);
+        self.persist_session_event(session_id, &branch_id, &event)
+            .await;
         Ok(event)
     }
 

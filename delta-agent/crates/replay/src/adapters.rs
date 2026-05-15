@@ -84,6 +84,24 @@ pub struct PersistedArtifactRecord {
     pub versions: Vec<PersistedArtifactVersion>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSessionMessage {
+    pub id: String,
+    pub branch_id: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSessionEvent {
+    pub id: String,
+    pub branch_id: String,
+    pub event_type: String,
+    pub payload: Value,
+    pub timestamp: u64,
+}
+
 impl RedisVddabRepository {
     pub async fn connect(
         redis_url: &str,
@@ -1022,6 +1040,52 @@ impl RedisVddabRepository {
         Ok(artifact_ids)
     }
 
+    pub async fn append_session_message(
+        &self,
+        session_id: &str,
+        message: &PersistedSessionMessage,
+    ) -> Result<()> {
+        let key = self
+            .keyspace
+            .session_messages(session_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        self.enqueue_stream_payload(&key, message).await
+    }
+
+    pub async fn append_session_event(
+        &self,
+        session_id: &str,
+        event: &PersistedSessionEvent,
+    ) -> Result<()> {
+        let key = self
+            .keyspace
+            .session_events(session_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        self.enqueue_stream_payload(&key, event).await
+    }
+
+    pub async fn load_session_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<PersistedSessionMessage>> {
+        let key = self
+            .keyspace
+            .session_messages(session_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        self.load_stream_payloads(&key).await
+    }
+
+    pub async fn load_session_events(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<PersistedSessionEvent>> {
+        let key = self
+            .keyspace
+            .session_events(session_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        self.load_stream_payloads(&key).await
+    }
+
     pub async fn enqueue_workflow_job(&self, job: &DurableWorkflowJob) -> Result<()> {
         let key = self.keyspace.workflow_queue();
         self.enqueue_stream_payload(&key, job).await
@@ -1054,6 +1118,30 @@ impl RedisVddabRepository {
             .await
             .with_context(|| format!("failed to append stream payload for key '{}'", key))?;
         Ok(())
+    }
+
+    async fn load_stream_payloads<T: DeserializeOwned>(&self, key: &str) -> Result<Vec<T>> {
+        let mut conn = self.redis.clone();
+        let range: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+            .arg(key)
+            .arg("-")
+            .arg("+")
+            .query_async(&mut conn)
+            .await
+            .with_context(|| format!("failed to read stream payloads for key '{}'", key))?;
+        let mut decoded = Vec::with_capacity(range.ids.len());
+        for entry in range.ids {
+            if let Some(payload) = entry
+                .map
+                .get("payload")
+                .and_then(|value| redis::from_redis_value::<String>(value).ok())
+            {
+                let item = serde_json::from_str::<T>(&payload)
+                    .with_context(|| format!("invalid stream payload in key '{}'", key))?;
+                decoded.push(item);
+            }
+        }
+        Ok(decoded)
     }
 
     async fn dequeue_stream_payload<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
