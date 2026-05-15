@@ -1,6 +1,6 @@
 # Delta Agent Workspace
 
-A production-oriented Rust workspace layout for DeltaShot, VDDAB, Penpal/Lattice, streaming, trace viewing, priority scheduling, compression, and hashing.
+A production-oriented Rust workspace focused on DeltaShot execution, Redis/VDDAB durability, workflow processing, and API/worker runtimes.
 
 ## Environment setup
 
@@ -19,9 +19,25 @@ This prepares the environment by:
 
 - `crates/*`: reusable domain and infrastructure crates
 - `apps/server`: API-facing server binary
-- `apps/worker`: background scheduler/replay worker
+- `apps/worker`: background execution worker
 - `configs/default.toml`: baseline runtime configuration
 - `scripts/dev.sh`: local development helper
+
+### Active workspace scope
+
+The active build graph is intentionally runtime-focused:
+
+- core execution: `core`, `deltashot`, `replay`, `vddab`, `compression`, `hashing`
+- API/runtime: `api`, `apps/server`, `apps/worker`
+- supporting domain crate: `penpal`
+
+To reduce maintenance surface, the lightly wired crates are currently trimmed from workspace builds:
+
+- `crates/streaming`
+- `crates/trace`
+- `crates/cache`
+- `crates/snapshot`
+- `crates/scheduler`
 
 ## Quick start
 
@@ -44,12 +60,12 @@ Overrides:
 
 Health route examples:
 
-- `GET /sessions/{id}`
-- `GET /branches/{id}`
-- `GET /streaming/ping`
-- `POST /sessions/{id}/message`
+- `GET /api/v1/health`
+- `GET /api/v1/sessions/{id}`
+- `GET /api/v1/sessions/{id}/trace`
+- `POST /api/v1/sessions/{id}/messages`
 
-Deterministic request lifecycle for `POST /sessions/{id}/message`:
+Deterministic request lifecycle for `POST /api/v1/sessions/{id}/messages`:
 
 1. hydrate session state + recent messages
 2. acquire session lock

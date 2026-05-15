@@ -5,15 +5,10 @@ members = [
     "crates/deltashot",
     "crates/vddab",
     "crates/penpal",
-    "crates/snapshot",
-    "crates/scheduler",
-    "crates/streaming",
-    "crates/cache",
     "crates/compression",
     "crates/hashing",
     "crates/replay",
     "crates/api",
-    "crates/trace",
     "apps/server",
     "apps/worker"
 ]
