@@ -18,6 +18,13 @@ use crate::verifier::{decompress_ops, DeltaRepository, StateRepository};
 const DEFAULT_QUEUE_RECLAIM_IDLE_MS: usize = 60_000;
 const DEFAULT_QUEUE_RECLAIM_COUNT: usize = 1;
 
+#[derive(Debug, Clone, Default)]
+struct RedisVddabConnectOptions {
+    consumer_name: Option<String>,
+    queue_reclaim_idle_ms: Option<usize>,
+    queue_reclaim_count: Option<usize>,
+}
+
 #[derive(Clone)]
 pub struct RedisVddabRepository {
     redis: ConnectionManager,
@@ -130,6 +137,21 @@ impl RedisVddabRepository {
         keyspace: RedisKeyspace,
         vddab_root: impl Into<PathBuf>,
     ) -> Result<Self> {
+        Self::connect_with_options(
+            redis_url,
+            keyspace,
+            vddab_root,
+            RedisVddabConnectOptions::default(),
+        )
+        .await
+    }
+
+    async fn connect_with_options(
+        redis_url: &str,
+        keyspace: RedisKeyspace,
+        vddab_root: impl Into<PathBuf>,
+        options: RedisVddabConnectOptions,
+    ) -> Result<Self> {
         let client = redis::Client::open(redis_url)
             .with_context(|| format!("invalid redis url '{}'", redis_url))?;
         let redis = client
@@ -143,16 +165,22 @@ impl RedisVddabRepository {
             keyspace,
             deltashot_store: DeltaShotStore::new(root.clone()),
             snapshot_store: SnapshotStore::new(root),
-            consumer_name: build_consumer_name(),
-            queue_reclaim_idle_ms: read_env_usize(
-                "DELTA_AGENT_QUEUE_RECLAIM_IDLE_MS",
-                DEFAULT_QUEUE_RECLAIM_IDLE_MS,
-            ),
-            queue_reclaim_count: read_env_usize(
-                "DELTA_AGENT_QUEUE_RECLAIM_COUNT",
-                DEFAULT_QUEUE_RECLAIM_COUNT,
-            )
-            .max(1),
+            consumer_name: options.consumer_name.unwrap_or_else(build_consumer_name),
+            queue_reclaim_idle_ms: options.queue_reclaim_idle_ms.unwrap_or_else(|| {
+                read_env_usize(
+                    "DELTA_AGENT_QUEUE_RECLAIM_IDLE_MS",
+                    DEFAULT_QUEUE_RECLAIM_IDLE_MS,
+                )
+            }),
+            queue_reclaim_count: options
+                .queue_reclaim_count
+                .unwrap_or_else(|| {
+                    read_env_usize(
+                        "DELTA_AGENT_QUEUE_RECLAIM_COUNT",
+                        DEFAULT_QUEUE_RECLAIM_COUNT,
+                    )
+                })
+                .max(1),
         })
     }
 
@@ -1586,5 +1614,255 @@ impl StateRepository for RedisVddabRepository {
             .await
             .with_context(|| format!("failed to read vddab snapshot for '{}'", branch_id))?;
         Ok(snapshot.unwrap_or((Value::Object(serde_json::Map::new()), 0)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::process;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use anyhow::{Context, Result};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn workflow_queue_reclaims_stale_pending_from_other_consumer() -> Result<()> {
+        let Some(redis_url) = integration_redis_url() else {
+            eprintln!("skipping reclaim integration test: DELTA_AGENT_REDIS_URL/REDIS_URL not set");
+            return Ok(());
+        };
+        let test_ns = test_namespace("workflow-reclaim");
+        let keyspace = RedisKeyspace::new(test_ns.clone())?;
+        if !supports_xautoclaim(
+            &redis_url,
+            &keyspace.workflow_queue(),
+            WORKFLOW_WORKERS_GROUP,
+        )
+        .await?
+        {
+            eprintln!("skipping reclaim integration test: redis server lacks XAUTOCLAIM support");
+            return Ok(());
+        }
+        let temp_root = std::env::temp_dir().join(format!("delta-agent-replay-{test_ns}"));
+        let consumer_a =
+            connect_test_repo(&redis_url, keyspace.clone(), temp_root.clone(), "crash-a")
+                .await
+                .context("failed to connect first consumer")?;
+        let consumer_b =
+            connect_test_repo(&redis_url, keyspace.clone(), temp_root.clone(), "crash-b")
+                .await
+                .context("failed to connect second consumer")?;
+
+        let expected = DurableWorkflowJob {
+            workflow_id: "wf_crash_reclaim".to_owned(),
+            session_id: "sess_crash".to_owned(),
+            step: "run".to_owned(),
+            payload: "{\"task\":\"recover\"}".to_owned(),
+            timestamp_ms: 1,
+            attempt: 0,
+        };
+        consumer_a.enqueue_workflow_job(&expected).await?;
+        let _leased = consumer_a
+            .dequeue_workflow_job()
+            .await?
+            .context("first consumer failed to lease workflow job")?;
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let (reclaimed_entry, reclaimed) = consumer_b
+            .dequeue_workflow_job()
+            .await?
+            .context("second consumer failed to reclaim stale workflow job")?;
+        assert_eq!(reclaimed.workflow_id, expected.workflow_id);
+        assert_eq!(reclaimed.session_id, expected.session_id);
+
+        consumer_b.ack_workflow_job_entry(&reclaimed_entry).await?;
+        assert!(
+            consumer_b.dequeue_workflow_job().await?.is_none(),
+            "acked reclaimed workflow job should not be redelivered"
+        );
+
+        cleanup_namespace(&redis_url, &test_ns).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn notion_queue_reclaims_stale_pending_from_other_consumer() -> Result<()> {
+        let Some(redis_url) = integration_redis_url() else {
+            eprintln!("skipping reclaim integration test: DELTA_AGENT_REDIS_URL/REDIS_URL not set");
+            return Ok(());
+        };
+        let test_ns = test_namespace("notion-reclaim");
+        let keyspace = RedisKeyspace::new(test_ns.clone())?;
+        if !supports_xautoclaim(
+            &redis_url,
+            &keyspace.notion_sync_queue(),
+            NOTION_SYNC_WORKERS_GROUP,
+        )
+        .await?
+        {
+            eprintln!("skipping reclaim integration test: redis server lacks XAUTOCLAIM support");
+            return Ok(());
+        }
+        let temp_root = std::env::temp_dir().join(format!("delta-agent-replay-{test_ns}"));
+        let consumer_a =
+            connect_test_repo(&redis_url, keyspace.clone(), temp_root.clone(), "crash-a")
+                .await
+                .context("failed to connect first consumer")?;
+        let consumer_b =
+            connect_test_repo(&redis_url, keyspace.clone(), temp_root.clone(), "crash-b")
+                .await
+                .context("failed to connect second consumer")?;
+
+        let expected = DurableNotionSyncJob {
+            session_id: "sess_crash".to_owned(),
+            summary: "sync me".to_owned(),
+            artifacts: vec!["art_1".to_owned()],
+            timestamp_ms: 1,
+            attempt: 0,
+        };
+        consumer_a.enqueue_notion_sync_job(&expected).await?;
+        let _leased = consumer_a
+            .dequeue_notion_sync_job()
+            .await?
+            .context("first consumer failed to lease notion job")?;
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let (reclaimed_entry, reclaimed) = consumer_b
+            .dequeue_notion_sync_job()
+            .await?
+            .context("second consumer failed to reclaim stale notion job")?;
+        assert_eq!(reclaimed.session_id, expected.session_id);
+        assert_eq!(reclaimed.summary, expected.summary);
+
+        consumer_b
+            .ack_notion_sync_job_entry(&reclaimed_entry)
+            .await?;
+        assert!(
+            consumer_b.dequeue_notion_sync_job().await?.is_none(),
+            "acked reclaimed notion job should not be redelivered"
+        );
+
+        cleanup_namespace(&redis_url, &test_ns).await?;
+        Ok(())
+    }
+
+    async fn connect_test_repo(
+        redis_url: &str,
+        keyspace: RedisKeyspace,
+        temp_root: PathBuf,
+        consumer_name: &str,
+    ) -> Result<RedisVddabRepository> {
+        RedisVddabRepository::connect_with_options(
+            redis_url,
+            keyspace,
+            temp_root,
+            RedisVddabConnectOptions {
+                consumer_name: Some(consumer_name.to_owned()),
+                queue_reclaim_idle_ms: Some(1),
+                queue_reclaim_count: Some(8),
+            },
+        )
+        .await
+    }
+
+    async fn supports_xautoclaim(redis_url: &str, key: &str, group: &str) -> Result<bool> {
+        let client = redis::Client::open(redis_url)
+            .with_context(|| format!("invalid redis url '{}'", redis_url))?;
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("failed to create redis connection")?;
+        let create_group_result = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(key)
+            .arg(group)
+            .arg("0")
+            .arg("MKSTREAM")
+            .query_async::<Option<String>>(&mut conn)
+            .await;
+        if let Err(err) = create_group_result {
+            let message = err.to_string();
+            if !message.contains("BUSYGROUP") {
+                return Err(anyhow!(err)).with_context(|| {
+                    format!("failed to create stream group '{}' for '{}'", group, key)
+                });
+            }
+        }
+
+        let probe: std::result::Result<redis::Value, redis::RedisError> = redis::cmd("XAUTOCLAIM")
+            .arg(key)
+            .arg(group)
+            .arg("probe")
+            .arg(0)
+            .arg("0-0")
+            .arg("COUNT")
+            .arg(1)
+            .query_async(&mut conn)
+            .await;
+        match probe {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                let message = err.to_string();
+                if message.contains("unknown command") || message.contains("ERR unknown command") {
+                    Ok(false)
+                } else {
+                    Err(anyhow!(err)).context("failed to probe XAUTOCLAIM support")
+                }
+            }
+        }
+    }
+
+    async fn cleanup_namespace(redis_url: &str, env: &str) -> Result<()> {
+        let client = redis::Client::open(redis_url)
+            .with_context(|| format!("invalid redis url '{}'", redis_url))?;
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("failed to create redis connection")?;
+        let pattern = format!("{env}:*");
+        let mut cursor = 0_u64;
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut conn)
+                .await
+                .context("failed to scan redis test keys")?;
+            if !keys.is_empty() {
+                let _: i64 = redis::cmd("DEL")
+                    .arg(keys)
+                    .query_async(&mut conn)
+                    .await
+                    .context("failed to delete redis test keys")?;
+            }
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
+        }
+        Ok(())
+    }
+
+    fn integration_redis_url() -> Option<String> {
+        std::env::var("DELTA_AGENT_REDIS_URL")
+            .ok()
+            .or_else(|| std::env::var("REDIS_URL").ok())
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn test_namespace(label: &str) -> String {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("itest-{label}-{}-{ts}", process::id())
     }
 }
