@@ -4,7 +4,7 @@ version.workspace   = true
 edition.workspace   = true
 
 [[bin]]
-name = "pcw"
+name = "pcw-server"
 path = "src/main.rs"
 
 [dependencies]
@@ -29,6 +29,5 @@ tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid         = { workspace = true }
 chrono       = { workspace = true }
-anyhow       = { workspace = true }
 reqwest      = { workspace = true }
 dotenvy      = { workspace = true }

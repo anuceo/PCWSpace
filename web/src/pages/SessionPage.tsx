@@ -75,8 +75,13 @@ export default function SessionPage() {
 
   const closeSession = async () => {
     if (!id) return;
-    await api.closeSession(id);
-    queryClient.invalidateQueries({ queryKey: ['session', id] });
+    try {
+      await api.closeSession(id);
+      queryClient.invalidateQueries({ queryKey: ['session', id] });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setMessages(prev => [...prev, { role: 'system', content: `Close error: ${msg}` }]);
+    }
   };
 
   const forkSession = async () => {
@@ -224,15 +229,17 @@ function ArtifactModal({ sessionId, onClose }: { sessionId: string; onClose: () 
   const [type, setType] = useState('doc');
   const [content, setContent] = useState('');
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
 
   const save = async () => {
     if (!name || !content) return;
     setSaving(true);
+    setError('');
     try {
       await api.createArtifact(sessionId, name, type, content);
       onClose();
-    } catch (e) {
-      alert(String(e));
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
     }
     setSaving(false);
   };
@@ -241,6 +248,7 @@ function ArtifactModal({ sessionId, onClose }: { sessionId: string; onClose: () 
     <div style={modalOverlay} onClick={onClose}>
       <div style={modalStyle} onClick={e => e.stopPropagation()}>
         <h3 style={{ marginBottom: '1rem' }}>Create Artifact</h3>
+        {error && <div style={{ color: 'var(--error)', fontSize: '0.8rem', marginBottom: 8 }}>{error}</div>}
         <input style={{ ...inputFieldStyle, marginBottom: 8 }} placeholder="Name" value={name} onChange={e => setName(e.target.value)} />
         <select style={{ ...inputFieldStyle, marginBottom: 8 }} value={type} onChange={e => setType(e.target.value)}>
           <option value="doc">Document</option>

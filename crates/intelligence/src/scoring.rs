@@ -46,7 +46,7 @@ fn score_actionability(text: &str) -> f32 {
     ];
     let lower = text.to_lowercase();
     let count = action_words.iter().filter(|w| lower.contains(*w)).count();
-    (count as f32 * 0.15).min(1.0).max(0.1)
+    (count as f32 * 0.15).clamp(0.1, 1.0)
 }
 
 #[cfg(test)]

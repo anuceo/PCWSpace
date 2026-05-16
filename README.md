@@ -60,22 +60,22 @@ Sits between the user's message and the agent router.
 Manages every piece of content produced or stored in the workspace.
 
 #### `service.rs`
-- `ArtifactService::create()` stores v1, issues a baton, sets latest pointer, adds root to session artifact set
-- `get()` resolves root, checks dropped set before returning
-- `list_for_session()` returns one entry per logical artifact, always current content
+- `ArtifactService::create()` stores v1, sets latest pointer, adds root to session artifact set
+- `get()` resolves artifact by ID
+- `list_for_session()` returns all artifacts for a session
 
 #### `versions.rs`
-- `new_version()` takes root ID, baton-verifies session, reads true current version number, increments, stores new artifact
+- `new_version()` takes root ID, reads true current version number, increments, stores new artifact
 - Appends to version list
-- Sets 7-day expiry on superseded snapshots (root and new latest exempt)
 - Advances latest pointer
 
-#### `baton.rs` — Session Ownership Enforcement
+#### `baton.rs` — Session Ownership Enforcement *(planned — not yet implemented)*
 - `init()` — Binds session ID to root artifact at creation
 - `verify()` — Checks deny set first (permanent), then compares stored session to caller
 - `drop_baton()` — Adds root to `pcw:baton:dropped` (no TTL, permanent)
   - Sets 1-hour ephemeral TTL on baton key, latest pointer, versions list
   - Once dropped: every write and read returns `403 BatonDropped`, even from original owner
+- **7-day expiry** on superseded snapshots (root and new latest exempt) *(planned)*
 
 ### 4. **DeltaShots** — Event Sourcing Engine
 
@@ -224,9 +224,9 @@ Runs before server starts:
 
 #### `handlers/mod.rs`
 - `map_err()` translates `PcwError` to HTTP status:
-  - 404 for not-found variants
-  - 400 for invalid input
-  - 403 for `BatonDropped`
+  - 404 for not-found variants (session, artifact, workflow, workspace)
+  - 400 for invalid input / invalid transition
+  - 403 for `BatonDropped` *(planned — requires baton implementation)*
   - 500 for everything else
 
 ## API Reference
@@ -252,7 +252,7 @@ Runs before server starts:
 | GET | `/api/v1/sessions/:id/rollback-points` | All shots as rollback points |
 | POST | `/api/v1/sessions/:id/fork` | Fork session at sequence N |
 
-## The 11 Crates
+## The Crates
 
 1. **pcw_core** — Foundation (config, errors, models)
 2. **infra** — Shared infrastructure (Redis, logging, metrics, Notion)
@@ -261,10 +261,11 @@ Runs before server starts:
 5. **runtime** — Session coordinator (orchestrator, scheduler)
 6. **audit** — Immutable audit log (log, report)
 7. **timeline** — Session branching (branch, graph)
-8. **api** — HTTP server (startup, middleware, routes, handlers)
-9. **rediagents** — Multi-LLM router (claude, deepseek, router)
+8. **api** — HTTP server (startup, middleware, routes, handlers) — binary: `pcw-server`
+9. **agents** — Multi-LLM router (claude, deepseek, router)
 10. **intelligence** — Task analysis (analyzer, scoring)
-11. **artifacts** — Document store (service, versions, baton)
+11. **artifacts** — Document store (service, versions)
+12. **pcw-cli** — Command-line interface — binary: `pcw`
 
 ## Redis Layout
 
@@ -304,10 +305,10 @@ Steps are queued to a Redis Stream consumer group. The background worker process
 
 ### Prerequisites
 
-- Rust 1.70 or later
+- Rust 1.85 or later (edition 2024 required by transitive dependencies)
 - Cargo
 - Redis (for event store and session management)
-- API keys for Claude and/or DeepSeek
+- API keys for Claude and/or DeepSeek (optional — server starts in degraded mode without them)
 
 ### Installation
 
@@ -329,7 +330,13 @@ cargo build --release
 Run the server (interactive startup wizard):
 
 ```bash
-cargo run --release
+cargo run -p api --release
+```
+
+Or use the CLI:
+
+```bash
+cargo run -p pcw-cli -- health
 ```
 
 The startup wizard will:
@@ -342,16 +349,22 @@ The startup wizard will:
 
 All configuration via environment variables (see `pcw_core::config`):
 
-- `REDIS_URL` — Redis connection string
-- `ANTHROPIC_API_KEY` — Claude API key
-- `DEEPSEEK_API_KEY` — DeepSeek API key
-- `DEEPSEEK_BASE_URL` — DeepSeek API endpoint (optional, defaults to OpenAI-compatible)
-- `NOTION_API_KEY` — Notion integration (optional)
-- `PCW_API_KEY` — API key for this server
-- `PCW_HOST` — Server host (default: 127.0.0.1)
-- `PCW_PORT` — Server port (default: 3000)
-- `PCW_LOG_LEVEL` — Log level (default: info)
-- `SESSION_TTL_SECS` — Session lifetime in seconds (default: 86400)
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `REDIS_URL` | Redis connection string | `redis://127.0.0.1:6379` |
+| `ANTHROPIC_API_KEY` | Claude API key | (empty) |
+| `CLAUDE_MODEL` | Claude model to use | `claude-sonnet-4-6` |
+| `DEEPSEEK_API_KEY` | DeepSeek API key (optional) | (empty) |
+| `DEEPSEEK_BASE_URL` | DeepSeek API endpoint | `https://api.deepseek.com` |
+| `DEEPSEEK_MODEL` | DeepSeek model to use | `deepseek-chat` |
+| `NOTION_TOKEN` | Notion integration token (optional) | (empty) |
+| `NOTION_DATABASE_ID` | Notion database for sessions (optional) | (empty) |
+| `NOTION_ARTIFACTS_DATABASE_ID` | Notion database for artifacts (optional) | (empty) |
+| `PCW_API_KEY` | API key for authenticating requests | `dev-insecure` |
+| `PCW_HOST` | Server bind host | `0.0.0.0` |
+| `PCW_PORT` | Server bind port | `8000` |
+| `PCW_LOG_LEVEL` | Log level (trace/debug/info/warn/error) | `info` |
+| `SESSION_KEY_TTL_SECS` | Encryption key TTL in seconds | `86400` |
 
 ## Development
 
@@ -367,20 +380,42 @@ cargo doc --open
 cargo test --verbose
 ```
 
+### Linting
+
+```bash
+cargo clippy --workspace --all-targets
+```
+
 ### Key Files to Know
 
-- `pcw_core/src/config.rs` — Configuration singleton
-- `pcw_core/src/errors.rs` — Error types
-- `deltashots/src/engine.rs` — DeltaShot append pipeline
-- `deltashots/src/replay.rs` — State reconstruction
-- `api/src/handlers/` — Request handlers
-- `runtime/src/orchestrator.rs` — Full agent call lifecycle
+- `crates/core/src/config.rs` — Configuration singleton
+- `crates/core/src/errors.rs` — Error types
+- `crates/deltashots/src/engine.rs` — DeltaShot append pipeline
+- `crates/deltashots/src/replay.rs` — State reconstruction
+- `crates/api/src/handlers/` — Request handlers
+- `crates/runtime/src/orchestrator.rs` — Full agent call lifecycle
+
+### Web Dashboard
+
+```bash
+cd web && npm install && npm run dev
+```
+
+Opens on `http://localhost:3000` with proxy to the API server on port 8000.
+
+### CLI
+
+```bash
+cargo build -p pcw-cli
+./target/debug/pcw --help
+```
 
 ## Contributing
 
 Contributions welcome! Areas of interest:
 
 - Additional LLM integrations
+- Baton ownership enforcement (session-bound artifact access control)
 - Workflow template library
 - Audit report generators
 - Performance optimizations
@@ -390,7 +425,7 @@ Please submit issues and pull requests on GitHub.
 
 ## License
 
-Specify your license here (e.g., MIT, Apache-2.0, etc.)
+MIT
 
 ## Author
 
@@ -399,7 +434,3 @@ Specify your license here (e.g., MIT, Apache-2.0, etc.)
 ## Support
 
 For issues, questions, or suggestions, open an issue on the [GitHub repository](https://github.com/anuceo/PCWSpace/issues).
-
----
-
-*Last updated: 2026-04-30*

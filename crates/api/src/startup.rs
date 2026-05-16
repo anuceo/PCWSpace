@@ -32,21 +32,24 @@ pub fn print_banner() {
 
 fn prompt(label: &str) -> String {
     print!("  {BOLD}{label}{RESET} ");
-    io::stdout().flush().unwrap();
+    let _ = io::stdout().flush();
     let mut buf = String::new();
-    io::stdin().read_line(&mut buf).unwrap();
+    if io::stdin().read_line(&mut buf).is_err() {
+        return String::new();
+    }
     buf.trim().to_string()
 }
 
 fn prompt_secret(label: &str) -> String {
-    // Use rpassword if available; fall back to plain stdin with a note
     print!("  {BOLD}{label}{RESET} ");
-    io::stdout().flush().unwrap();
+    let _ = io::stdout().flush();
     match rpassword_read() {
         Some(s) => s,
         None => {
             let mut buf = String::new();
-            io::stdin().read_line(&mut buf).unwrap();
+            if io::stdin().read_line(&mut buf).is_err() {
+                return String::new();
+            }
             buf.trim().to_string()
         }
     }
@@ -199,7 +202,7 @@ async fn network_setup_flow() {
 
     println!();
     println!("  {BOLD}Available Wi-Fi networks:{RESET}");
-    println!("  {DIM}{:<4} {:<32} {:<8} {}{RESET}", "#", "SSID", "Signal", "Security");
+    println!("  {DIM}{:<4} {:<32} {:<8} {:<10}{RESET}", "#", "SSID", "Signal", "Security");
     println!("  {DIM}{}{RESET}", "─".repeat(60));
 
     for (i, net) in networks.iter().enumerate() {
@@ -226,7 +229,7 @@ async fn network_setup_flow() {
         }
     };
 
-    let ssid = networks[idx].splitn(2, ':').next().unwrap_or("").to_string();
+    let ssid = networks[idx].split(':').next().unwrap_or("").to_string();
     let password = prompt_secret(&format!("Password for '{ssid}' (Enter if open):"));
 
     info(&format!("Connecting to '{ssid}'..."));
@@ -255,7 +258,7 @@ async fn verify_redis(url: &str) -> Result<String, String> {
         .await
         .map_err(|e| e.to_string())?;
     if pong == "PONG" {
-        Ok(format!("connected ({})", url.split('@').last().unwrap_or(url)))
+        Ok(format!("connected ({})", url.split('@').next_back().unwrap_or(url)))
     } else {
         Err(format!("unexpected response: {pong}"))
     }
@@ -265,7 +268,7 @@ async fn verify_anthropic(api_key: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .unwrap();
+        .map_err(|e| format!("HTTP client error: {e}"))?;
 
     let resp = client
         .get("https://api.anthropic.com/v1/models")
@@ -291,7 +294,7 @@ async fn verify_deepseek(api_key: &str, base_url: &str) -> Result<String, String
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .unwrap();
+        .map_err(|e| format!("HTTP client error: {e}"))?;
 
     let url = format!("{base_url}/v1/models");
     let resp = client
@@ -312,7 +315,7 @@ async fn verify_notion(token: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .unwrap();
+        .map_err(|e| format!("HTTP client error: {e}"))?;
 
     let resp = client
         .get("https://api.notion.com/v1/users/me")

@@ -1,7 +1,7 @@
 const BASE_URL = import.meta.env.VITE_PCW_URL || '';
 const API_KEY = import.meta.env.VITE_PCW_API_KEY || 'dev-insecure';
 
-async function request(path: string, options?: RequestInit) {
+async function request<T = unknown>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {
     ...options,
     headers: {
@@ -10,6 +10,13 @@ async function request(path: string, options?: RequestInit) {
       ...options?.headers,
     },
   });
+
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    const text = await res.text();
+    throw new Error(text || `HTTP ${res.status}`);
+  }
+
   const json = await res.json();
   if (!json.ok && json.error) {
     throw new Error(json.error);
@@ -22,58 +29,58 @@ export const api = {
 
   // Workspaces
   createWorkspace: (name: string) =>
-    request('/api/v1/workspaces', { method: 'POST', body: JSON.stringify({ name }) }),
+    request<any>('/api/v1/workspaces', { method: 'POST', body: JSON.stringify({ name }) }),
 
   // Sessions
   createSession: (workspace_id: string) =>
-    request('/api/v1/sessions', { method: 'POST', body: JSON.stringify({ workspace_id }) }),
-  getSession: (id: string) => request(`/api/v1/sessions/${id}`),
+    request<any>('/api/v1/sessions', { method: 'POST', body: JSON.stringify({ workspace_id }) }),
+  getSession: (id: string) => request<any>(`/api/v1/sessions/${id}`),
   closeSession: (id: string) =>
-    request(`/api/v1/sessions/${id}/close`, { method: 'POST' }),
-  getSessionArtifacts: (id: string) => request(`/api/v1/sessions/${id}/artifacts`),
+    request<any>(`/api/v1/sessions/${id}/close`, { method: 'POST' }),
+  getSessionArtifacts: (id: string) => request<any[]>(`/api/v1/sessions/${id}/artifacts`),
 
   // Agent
   callAgent: (session_id: string, message: string, agent?: string, system_prompt?: string) =>
-    request(`/api/v1/sessions/${session_id}/agent`, {
+    request<any>(`/api/v1/sessions/${session_id}/agent`, {
       method: 'POST',
       body: JSON.stringify({ message, agent, system_prompt }),
     }),
 
   // Artifacts
   createArtifact: (session_id: string, name: string, artifact_type: string, content: string) =>
-    request('/api/v1/artifacts', {
+    request<any>('/api/v1/artifacts', {
       method: 'POST',
       body: JSON.stringify({ session_id, name, artifact_type, content }),
     }),
-  getArtifact: (id: string) => request(`/api/v1/artifacts/${id}`),
+  getArtifact: (id: string) => request<any>(`/api/v1/artifacts/${id}`),
   createVersion: (id: string, content: string) =>
-    request(`/api/v1/artifacts/${id}/versions`, {
+    request<any>(`/api/v1/artifacts/${id}/versions`, {
       method: 'POST',
       body: JSON.stringify({ content }),
     }),
-  listVersions: (id: string) => request(`/api/v1/artifacts/${id}/versions`),
+  listVersions: (id: string) => request<string[]>(`/api/v1/artifacts/${id}/versions`),
 
   // Workflows
-  listDefinitions: () => request('/api/v1/workflow-definitions'),
+  listDefinitions: () => request<any[]>('/api/v1/workflow-definitions'),
   startWorkflow: (definition_name: string, session_id: string, input: object) =>
-    request('/api/v1/workflows', {
+    request<any>('/api/v1/workflows', {
       method: 'POST',
       body: JSON.stringify({ definition_name, session_id, input }),
     }),
-  getWorkflow: (id: string) => request(`/api/v1/workflows/${id}`),
+  getWorkflow: (id: string) => request<any>(`/api/v1/workflows/${id}`),
 
   // Timeline
   getDeltashotCount: (session_id: string) =>
-    request(`/api/v1/sessions/${session_id}/deltashots/count`),
+    request<any>(`/api/v1/sessions/${session_id}/deltashots/count`),
   getRollbackPoints: (session_id: string) =>
-    request(`/api/v1/sessions/${session_id}/rollback-points`),
+    request<any[]>(`/api/v1/sessions/${session_id}/rollback-points`),
   replay: (session_id: string, sequence: number) =>
-    request(`/api/v1/sessions/${session_id}/replay`, {
+    request<any>(`/api/v1/sessions/${session_id}/replay`, {
       method: 'POST',
       body: JSON.stringify({ sequence }),
     }),
   forkSession: (session_id: string, fork_at_sequence: number) =>
-    request(`/api/v1/sessions/${session_id}/fork`, {
+    request<any>(`/api/v1/sessions/${session_id}/fork`, {
       method: 'POST',
       body: JSON.stringify({ fork_at_sequence }),
     }),
