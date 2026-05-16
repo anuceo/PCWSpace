@@ -4,3 +4,6 @@ Cargo.lock
 .env
 *.pem
 *.key
+web/node_modules
+web/dist
+dump.rdb

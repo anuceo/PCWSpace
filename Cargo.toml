@@ -11,6 +11,7 @@ members = [
     "crates/audit",
     "crates/timeline",
     "crates/api",
+    "crates/cli",
 ]
 resolver = "2"
 
