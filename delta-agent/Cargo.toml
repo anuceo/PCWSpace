@@ -11,6 +11,7 @@ members = [
     "crates/api",
     "crates/cache",
     "crates/scheduler",
+    "crates/streaming",
     "apps/server",
     "apps/worker"
 ]

@@ -140,7 +140,7 @@ pub async fn audit_replay(
         let canonical = canonical_serialize_ops(&ops)?;
         let recomputed = compute_chain_hash(&last_hash, &canonical);
 
-        if recomputed != ds.hash || (!last_hash.is_empty() && ds.prev_hash != last_hash) {
+        if recomputed != ds.hash || ds.prev_hash != last_hash {
             error!("Mismatch at DeltaShot {}", ds.id);
             debug!(
                 "Expected hash: {}, got: {}; expected prev: {}, got: {}",
