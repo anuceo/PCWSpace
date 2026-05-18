@@ -19,10 +19,10 @@ use crate::pipeline::{
     ApiErrorBody, ApiErrorEnvelope, ApiResponseMeta, ArtifactVersionView, ArtifactWriteRequest,
     BranchAuditResponse, BranchCreateRequest, BranchListResponse, BranchMergeRequest,
     BranchMergeResponse, BranchSwitchRequest, BranchSwitchResponse, CreateSessionRequest,
-    CreateWorkspaceRequest, DeltashotView, ExecutionTrace, ForceAgentRequest, MessageRecord,
+    CreateWorkspaceRequest, DeltashotView, ExecutionTrace, ForceAgentRequest,
     NotionSyncExecutionResult, PipelineError, PipelineState, RollbackRequest, SendMessageRequestV1,
-    SessionView, StreamMessageRequestV1, WorkflowExecutionResult, WorkflowStartRequest,
-    WorkflowStepRequest,
+    SessionView, StreamMessageRequestV1, WorkflowExecutionResult, WorkflowQueueDepthResponse,
+    WorkflowStartRequest, WorkflowStepRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +84,9 @@ pub fn router() -> Router<Arc<PipelineState>> {
         )
         .route("/workflows/{workflowId}/state", get(get_workflow_state))
         .route("/workflows/{workflowId}/step", post(advance_workflow_step))
+        .route("/workflows/{workflowId}/complete", post(complete_workflow))
+        .route("/workflows/{workflowId}/cancel", post(cancel_workflow))
+        .route("/workflows/queue/depth", get(get_workflow_queue_depth))
         .route("/sessions/{sessionId}/agent", post(force_agent_selection))
         .route("/sessions/{sessionId}/agents/logs", get(get_agent_logs))
         .route("/sessions/{sessionId}/trace", get(get_trace))
@@ -91,10 +94,10 @@ pub fn router() -> Router<Arc<PipelineState>> {
             "/debug/sessions/{sessionId}/branches/{branchId}/audit",
             post(run_branch_audit),
         )
-        .route("/sessions/{sessionId}/branch", post(create_branch))
+        .route("/sessions/{sessionId}/branches", post(create_branch))
         .route("/sessions/{sessionId}/branches", get(list_branches))
-        .route("/sessions/{sessionId}/branch/switch", post(switch_branch))
-        .route("/sessions/{sessionId}/branch/merge", post(merge_branch))
+        .route("/sessions/{sessionId}/branches/switch", post(switch_branch))
+        .route("/sessions/{sessionId}/branches/merge", post(merge_branch))
         .route(
             "/sessions/{sessionId}/messages/stream",
             post(stream_message),
@@ -186,10 +189,9 @@ async fn get_session_messages(
     let limit = query.limit.unwrap_or(50);
     let cursor = query.cursor;
     with_meta(async move {
-        let data = state
+        state
             .get_session_messages(&session_id, limit, cursor)
-            .await?;
-        Ok::<Vec<MessageRecord>, PipelineError>(data)
+            .await
     })
     .await
 }
@@ -408,6 +410,29 @@ async fn merge_branch(
     with_meta(async move {
         let merged = state.merge_branch(&session_id, request).await?;
         Ok::<BranchMergeResponse, PipelineError>(merged)
+    })
+    .await
+}
+
+async fn complete_workflow(
+    Path(workflow_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    with_meta(async move { state.terminate_workflow(&workflow_id, "completed").await }).await
+}
+
+async fn cancel_workflow(
+    Path(workflow_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    with_meta(async move { state.terminate_workflow(&workflow_id, "cancelled").await }).await
+}
+
+async fn get_workflow_queue_depth(
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    with_meta(async move {
+        Ok::<WorkflowQueueDepthResponse, PipelineError>(state.workflow_queue_depth().await)
     })
     .await
 }

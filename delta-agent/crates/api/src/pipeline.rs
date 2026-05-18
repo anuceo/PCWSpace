@@ -285,6 +285,8 @@ pub struct MessageRecord {
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionMessagesResponse {
     pub messages: Vec<MessageRecord>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -346,6 +348,17 @@ pub struct WorkflowExecutionResult {
     pub step: String,
     pub deltashot_id: String,
     pub state_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowQueueDepthResponse {
+    pub depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowTerminateResponse {
+    pub workflow_id: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1271,12 +1284,15 @@ impl ExecutionPipeline {
                 .workflow_id
                 .clone()
                 .unwrap_or_else(|| format!("wf-{}", session_id));
-            self.enqueue_workflow(&workflow_id, session_id, &workflow_step, Value::Null)
-                .await;
-            self.bind_session_workflow(session_id, &workflow_id).await;
+            let terminal = self.is_workflow_terminal(&workflow_id).await;
+            if !terminal {
+                self.enqueue_workflow(&workflow_id, session_id, &workflow_step, Value::Null)
+                    .await;
+                self.bind_session_workflow(session_id, &workflow_id).await;
+            }
             self.record_execution_step(
                 session_id,
-                "WORKFLOW_ENQUEUED",
+                if terminal { "WORKFLOW_TERMINAL_SKIP" } else { "WORKFLOW_ENQUEUED" },
                 serde_json::json!({ "workflow_id": workflow_id, "step": workflow_step.clone() }),
             )
             .await?;
@@ -1356,7 +1372,7 @@ impl ExecutionPipeline {
         session_id: &str,
         limit: usize,
         cursor: Option<String>,
-    ) -> Result<Vec<MessageRecord>, PipelineError> {
+    ) -> Result<SessionMessagesResponse, PipelineError> {
         let sessions = self.sessions.read().await;
         let Some(session) = sessions.get(session_id) else {
             return Err(PipelineError::NotFound(format!(
@@ -1366,23 +1382,37 @@ impl ExecutionPipeline {
         };
 
         let mut messages = session.messages.clone();
-        if let Some(cursor_id) = cursor {
-            if let Some(index) = messages.iter().position(|m| m.id == cursor_id) {
+        if let Some(cursor_id) = &cursor {
+            if let Some(index) = messages.iter().position(|m| &m.id == cursor_id) {
                 messages.truncate(index);
             }
         }
 
-        Ok(messages
+        let capped = limit.max(1);
+        let has_more = messages.len() > capped;
+        let page = messages
             .into_iter()
             .rev()
-            .take(limit.max(1))
+            .take(capped)
             .map(|m| MessageRecord {
                 id: m.id,
                 role: m.role,
                 content: m.content,
                 timestamp: m.timestamp,
             })
-            .collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        let next_cursor = if has_more {
+            page.last().map(|m| m.id.clone())
+        } else {
+            None
+        };
+
+        Ok(SessionMessagesResponse {
+            messages: page,
+            has_more,
+            next_cursor,
+        })
     }
 
     pub async fn list_deltashots(
@@ -1641,6 +1671,41 @@ impl ExecutionPipeline {
             session_id: Some(record.session_id.clone()),
             current_step: record.current_step.clone(),
         })
+    }
+
+    pub async fn terminate_workflow(
+        &self,
+        workflow_id: &str,
+        terminal_status: &str,
+    ) -> Result<WorkflowTerminateResponse, PipelineError> {
+        self.ensure_persistence_hydrated().await;
+        let snapshot = {
+            let mut workflows = self.workflows.write().await;
+            let record = workflows.get_mut(workflow_id).ok_or_else(|| {
+                PipelineError::NotFound(format!("workflow '{}' not found", workflow_id))
+            })?;
+            record.status = terminal_status.to_owned();
+            record.updated_at = now_ms();
+            record.clone()
+        };
+        self.persist_workflow_record(&snapshot).await;
+        Ok(WorkflowTerminateResponse {
+            workflow_id: workflow_id.to_owned(),
+            status: terminal_status.to_owned(),
+        })
+    }
+
+    pub async fn workflow_queue_depth(&self) -> WorkflowQueueDepthResponse {
+        let queue = self.workflow_queue.lock().await;
+        WorkflowQueueDepthResponse { depth: queue.len() }
+    }
+
+    async fn is_workflow_terminal(&self, workflow_id: &str) -> bool {
+        let workflows = self.workflows.read().await;
+        workflows
+            .get(workflow_id)
+            .map(|r| matches!(r.status.as_str(), "completed" | "cancelled"))
+            .unwrap_or(false)
     }
 
     pub async fn advance_workflow_step(
