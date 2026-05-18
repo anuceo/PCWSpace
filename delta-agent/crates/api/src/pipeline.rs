@@ -125,6 +125,8 @@ pub struct ArtifactWriteRequest {
     pub content: String,
     #[serde(default)]
     pub metadata: Value,
+    #[serde(default)]
+    pub tags: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,6 +359,7 @@ pub struct ArtifactView {
     pub artifact_type: String,
     pub current_version: u64,
     pub created_at: u64,
+    pub tags: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -719,6 +722,7 @@ struct ArtifactRecord {
     created_at: u64,
     current_version: u64,
     versions: BTreeMap<u64, String>,
+    tags: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1719,6 +1723,12 @@ impl ExecutionPipeline {
                 &request.content,
             )
             .await?;
+        if let Some(tags) = request.tags {
+            let mut artifacts = self.artifacts.write().await;
+            if let Some(record) = artifacts.get_mut(&outcome.envelope.artifact_id) {
+                record.tags = tags;
+            }
+        }
         Ok(outcome.envelope)
     }
 
@@ -1731,7 +1741,49 @@ impl ExecutionPipeline {
             artifact_type: record.artifact_type.clone(),
             current_version: record.current_version,
             created_at: record.created_at,
+            tags: record.tags.clone(),
         })
+    }
+
+    pub async fn search_artifacts(
+        &self,
+        session_id: Option<&str>,
+        artifact_type: Option<&str>,
+        tags: &HashMap<String, String>,
+        limit: usize,
+        cursor: Option<u64>,
+    ) -> Vec<ArtifactView> {
+        let limit = limit.max(1).min(200);
+        let artifacts = self.artifacts.read().await;
+
+        let mut views: Vec<(u64, ArtifactView)> = artifacts
+            .values()
+            .filter(|r| {
+                session_id.map_or(true, |s| r.session_id == s)
+                    && artifact_type.map_or(true, |t| r.artifact_type == t)
+                    && cursor.map_or(true, |ts| r.created_at < ts)
+                    && tags
+                        .iter()
+                        .all(|(k, v)| r.tags.get(k).map_or(false, |rv| rv == v))
+            })
+            .map(|r| {
+                (
+                    r.created_at,
+                    ArtifactView {
+                        artifact_id: r.artifact_id.clone(),
+                        session_id: r.session_id.clone(),
+                        artifact_type: r.artifact_type.clone(),
+                        current_version: r.current_version,
+                        created_at: r.created_at,
+                        tags: r.tags.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        views.sort_by(|(a, _), (b, _)| b.cmp(a));
+        views.truncate(limit);
+        views.into_iter().map(|(_, v)| v).collect()
     }
 
     pub async fn get_artifact_versions(&self, artifact_id: &str) -> Vec<ArtifactVersionView> {
@@ -2608,6 +2660,7 @@ impl ExecutionPipeline {
                                 created_at: record.created_at,
                                 current_version: record.current_version,
                                 versions,
+                                tags: HashMap::new(),
                             },
                         );
                         branch_artifacts
@@ -4087,6 +4140,7 @@ impl ExecutionPipeline {
                         created_at: now_ms(),
                         current_version: 1,
                         versions,
+                        tags: HashMap::new(),
                     },
                 );
                 (new_id, artifact_type.to_owned(), 1, None)

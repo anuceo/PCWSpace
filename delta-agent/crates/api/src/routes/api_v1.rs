@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,7 +19,7 @@ use tracing::Instrument;
 
 use crate::pipeline::{
     ApiErrorBody, ApiErrorEnvelope, ApiResponseMeta, ArtifactVersionView, ArtifactWriteRequest,
-    BatchMessageRequest, BranchAuditResponse, BranchCreateRequest,
+    ArtifactView, BatchMessageRequest, BranchAuditResponse, BranchCreateRequest,
     BranchListResponse, BranchMergeRequest, BranchMergeResponse, BranchSwitchRequest,
     BranchSwitchResponse, CreateSessionRequest, CreateWorkspaceRequest, DeltashotView,
     ExecutionTrace, ForceAgentRequest, NotionSyncExecutionResult, PipelineError, PipelineState,
@@ -43,6 +44,15 @@ struct SessionSearchQuery {
     workspace_id: Option<String>,
     created_after: Option<u64>,
     status: Option<String>,
+    limit: Option<usize>,
+    cursor: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactSearchQuery {
+    session_id: Option<String>,
+    #[serde(rename = "type")]
+    artifact_type: Option<String>,
     limit: Option<usize>,
     cursor: Option<u64>,
 }
@@ -78,7 +88,7 @@ pub fn router() -> Router<Arc<PipelineState>> {
         .route("/sessions/{sessionId}/deltashots", get(list_deltashots))
         .route("/sessions/{sessionId}/rollback", post(rollback_session))
         .route("/deltashots/{deltashotId}", get(get_deltashot))
-        .route("/artifacts", post(write_artifact))
+        .route("/artifacts", post(write_artifact).get(search_artifacts))
         .route("/artifacts/{artifactId}", get(get_artifact))
         .route(
             "/artifacts/{artifactId}/versions",
@@ -245,6 +255,36 @@ async fn write_artifact(
     Json(request): Json<ArtifactWriteRequest>,
 ) -> impl IntoResponse {
     with_meta(async move { state.create_or_update_artifact_api(request).await }).await
+}
+
+async fn search_artifacts(
+    Query(query): Query<ArtifactSearchQuery>,
+    Query(all_params): Query<HashMap<String, String>>,
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(20);
+    // Extract tag filters from bracket notation: tag[key]=value
+    let tags: HashMap<String, String> = all_params
+        .iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("tag[")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .map(|tag_key| (tag_key.to_owned(), v.clone()))
+        })
+        .collect();
+    with_meta(async move {
+        let results = state
+            .search_artifacts(
+                query.session_id.as_deref(),
+                query.artifact_type.as_deref(),
+                &tags,
+                limit,
+                query.cursor,
+            )
+            .await;
+        Ok::<Vec<ArtifactView>, PipelineError>(results)
+    })
+    .await
 }
 
 async fn get_artifact(
