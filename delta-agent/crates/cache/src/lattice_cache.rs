@@ -15,7 +15,7 @@ impl LatticeSliceCache {
         self.slices.put(key.into(), payload);
     }
 
-    pub fn get_slice(&mut self, key: &str) -> Option<&Vec<u8>> {
-        self.slices.get(&key.to_owned())
+    pub fn get_slice(&mut self, key: &str) -> Option<&[u8]> {
+        self.slices.get(key).map(Vec::as_slice)
     }
 }

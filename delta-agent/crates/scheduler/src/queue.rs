@@ -12,7 +12,7 @@ impl Ord for ScheduledTask {
     fn cmp(&self, other: &Self) -> Ordering {
         self.priority_score
             .cmp(&other.priority_score)
-            .then_with(|| self.id.cmp(&other.id))
+            .then_with(|| other.id.cmp(&self.id))
     }
 }
 

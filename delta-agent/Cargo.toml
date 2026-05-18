@@ -9,6 +9,8 @@ members = [
     "crates/hashing",
     "crates/replay",
     "crates/api",
+    "crates/cache",
+    "crates/scheduler",
     "apps/server",
     "apps/worker"
 ]
