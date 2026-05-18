@@ -215,6 +215,7 @@ pub struct SessionView {
     pub status: String,
     pub workflow_id: Option<String>,
     pub state_version: u64,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -290,6 +291,28 @@ pub struct SessionMessagesResponse {
     pub messages: Vec<MessageRecord>,
     pub has_more: bool,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchMessageRequest {
+    pub messages: Vec<SendMessageRequestV1>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchMessageItemResult {
+    pub index: usize,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<SendMessageResponseV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchMessageResponse {
+    pub results: Vec<BatchMessageItemResult>,
+    pub succeeded: usize,
+    pub failed: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -996,6 +1019,7 @@ impl ExecutionPipeline {
                     status: record.status.clone(),
                     workflow_id: record.workflow_id.clone(),
                     state_version: record.state.version,
+                    created_at: record.created_at,
                 })
             })
             .collect::<Vec<_>>()
@@ -1089,6 +1113,7 @@ impl ExecutionPipeline {
             status: session.status.clone(),
             workflow_id: session.workflow_id.clone(),
             state_version: session.state.version,
+            created_at: session.created_at,
         })
     }
 
@@ -1435,6 +1460,99 @@ impl ExecutionPipeline {
             has_more,
             next_cursor,
         })
+    }
+
+    pub async fn handle_message_batch(
+        &self,
+        session_id: &str,
+        request: BatchMessageRequest,
+    ) -> Result<BatchMessageResponse, PipelineError> {
+        self.ensure_session_exists(session_id).await?;
+        if request.messages.is_empty() {
+            return Err(PipelineError::InvalidInput(
+                "batch must contain at least one message".to_owned(),
+            ));
+        }
+        let mut results = Vec::with_capacity(request.messages.len());
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        for (index, msg) in request.messages.into_iter().enumerate() {
+            match self.handle_message_v1(session_id, msg).await {
+                Ok(response) => {
+                    succeeded += 1;
+                    results.push(BatchMessageItemResult {
+                        index,
+                        ok: true,
+                        response: Some(response),
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    failed += 1;
+                    results.push(BatchMessageItemResult {
+                        index,
+                        ok: false,
+                        response: None,
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
+        }
+        Ok(BatchMessageResponse { results, succeeded, failed })
+    }
+
+    pub async fn search_sessions(
+        &self,
+        workspace_id: Option<&str>,
+        created_after: Option<u64>,
+        status: Option<&str>,
+        limit: usize,
+        cursor: Option<u64>,
+    ) -> Vec<SessionView> {
+        let limit = limit.max(1).min(200);
+
+        let candidate_ids: Option<Vec<String>> = if let Some(wid) = workspace_id {
+            let idx = self.workspace_sessions.read().await;
+            Some(
+                idx.get(wid)
+                    .map(|v| v.iter().map(|(_, sid)| sid.clone()).collect())
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
+
+        let sessions = self.sessions.read().await;
+
+        let records: Vec<&SessionRecord> = match &candidate_ids {
+            Some(ids) => ids.iter().filter_map(|id| sessions.get(id.as_str())).collect(),
+            None => sessions.values().collect(),
+        };
+
+        let mut views: Vec<(u64, SessionView)> = records
+            .into_iter()
+            .filter(|r| {
+                created_after.map_or(true, |ts| r.created_at > ts)
+                    && status.map_or(true, |s| r.status == s)
+                    && cursor.map_or(true, |ts| r.created_at < ts)
+            })
+            .map(|r| {
+                (
+                    r.created_at,
+                    SessionView {
+                        session_id: r.session_id.clone(),
+                        status: r.status.clone(),
+                        workflow_id: r.workflow_id.clone(),
+                        state_version: r.state.version,
+                        created_at: r.created_at,
+                    },
+                )
+            })
+            .collect();
+
+        views.sort_by(|(a, _), (b, _)| b.cmp(a));
+        views.truncate(limit);
+        views.into_iter().map(|(_, v)| v).collect()
     }
 
     pub async fn list_deltashots(

@@ -14,15 +14,16 @@ use axum::{
 };
 use futures_util::stream;
 use serde::Deserialize;
+use tracing::Instrument;
 
 use crate::pipeline::{
     ApiErrorBody, ApiErrorEnvelope, ApiResponseMeta, ArtifactVersionView, ArtifactWriteRequest,
-    BranchAuditResponse, BranchCreateRequest, BranchListResponse, BranchMergeRequest,
-    BranchMergeResponse, BranchSwitchRequest, BranchSwitchResponse, CreateSessionRequest,
-    CreateWorkspaceRequest, DeltashotView, ExecutionTrace, ForceAgentRequest,
-    NotionSyncExecutionResult, PipelineError, PipelineState, RollbackRequest, SendMessageRequestV1,
-    SessionView, StreamMessageRequestV1, WorkflowDlqResponse, WorkflowExecutionResult,
-    WorkflowQueueDepthResponse, WorkflowStartRequest, WorkflowStepRequest,
+    BatchMessageRequest, BranchAuditResponse, BranchCreateRequest,
+    BranchListResponse, BranchMergeRequest, BranchMergeResponse, BranchSwitchRequest,
+    BranchSwitchResponse, CreateSessionRequest, CreateWorkspaceRequest, DeltashotView,
+    ExecutionTrace, ForceAgentRequest, NotionSyncExecutionResult, PipelineError, PipelineState,
+    RollbackRequest, SendMessageRequestV1, SessionView, StreamMessageRequestV1, WorkflowDlqResponse,
+    WorkflowExecutionResult, WorkflowQueueDepthResponse, WorkflowStartRequest, WorkflowStepRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +36,15 @@ struct WorkspaceSessionQuery {
 struct SessionMessagesQuery {
     limit: Option<usize>,
     cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionSearchQuery {
+    workspace_id: Option<String>,
+    created_after: Option<u64>,
+    status: Option<String>,
+    limit: Option<usize>,
+    cursor: Option<u64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -51,6 +61,7 @@ struct ExecuteNextNotionEnvelope {
 
 pub fn router() -> Router<Arc<PipelineState>> {
     Router::new()
+        .route("/sessions", get(search_sessions))
         .route("/workspaces", post(create_workspace))
         .route("/workspaces/{workspaceId}", get(get_workspace))
         .route(
@@ -61,6 +72,7 @@ pub fn router() -> Router<Arc<PipelineState>> {
         .route("/sessions/{sessionId}", get(get_session))
         .route("/sessions/{sessionId}/", get(get_session))
         .route("/sessions/{sessionId}/messages", post(send_message))
+        .route("/sessions/{sessionId}/messages/batch", post(send_message_batch))
         .route("/sessions/{sessionId}/state", get(get_session_state))
         .route("/sessions/{sessionId}/messages", get(get_session_messages))
         .route("/sessions/{sessionId}/deltashots", get(list_deltashots))
@@ -445,6 +457,39 @@ async fn get_workflow_dlq(State(state): State<Arc<PipelineState>>) -> impl IntoR
     .await
 }
 
+async fn search_sessions(
+    Query(query): Query<SessionSearchQuery>,
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(20);
+    with_meta(async move {
+        let sessions = state
+            .search_sessions(
+                query.workspace_id.as_deref(),
+                query.created_after,
+                query.status.as_deref(),
+                limit,
+                query.cursor,
+            )
+            .await;
+        Ok::<Vec<SessionView>, PipelineError>(sessions)
+    })
+    .await
+}
+
+async fn send_message_batch(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+    Json(request): Json<BatchMessageRequest>,
+) -> impl IntoResponse {
+    with_meta(async move {
+        state
+            .handle_message_batch(&session_id, request)
+            .await
+    })
+    .await
+}
+
 async fn stream_message(
     Path(session_id): Path<String>,
     State(state): State<Arc<PipelineState>>,
@@ -479,7 +524,8 @@ where
     let started = Instant::now();
     let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
     let now = now_ms();
-    match fut.await {
+    let span = tracing::info_span!("http.request", request_id = %request_id);
+    match fut.instrument(span).await {
         Ok(data) => {
             let payload = serde_json::to_value(data).unwrap_or_else(|_| serde_json::json!({}));
             let meta = serde_json::to_value(ApiResponseMeta {
