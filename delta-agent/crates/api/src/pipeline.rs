@@ -1322,29 +1322,25 @@ impl ExecutionPipeline {
         self.record_execution_step(session_id, "STATE_PERSISTED", Value::Null)
             .await?;
 
+        // workflow_step and workflow_active are used in the response envelope below.
+        // Re-enqueueing is NOT done here — it is the responsibility of the caller:
+        // start_workflow() seeds the first job; advance_workflow_step() pushes
+        // subsequent ones. Auto-requeueing after every execution causes an unbound
+        // execution storm (job → re-enqueue → job → …).
         let workflow_step = next_state
             .step
             .clone()
-            .unwrap_or_else(|| "continue".to_owned());
+            .unwrap_or_else(|| "idle".to_owned());
         let workflow_active =
             matches!(request.mode, MessageMode::Workflow | MessageMode::Execution)
                 || context.workflow_id.is_some();
 
-        if workflow_active {
-            let workflow_id = context
-                .workflow_id
-                .clone()
-                .unwrap_or_else(|| format!("wf-{}", session_id));
-            let terminal = self.is_workflow_terminal(&workflow_id).await;
-            if !terminal {
-                self.enqueue_workflow(&workflow_id, session_id, &workflow_step, Value::Null)
-                    .await;
-                self.bind_session_workflow(session_id, &workflow_id).await;
-            }
+        if let Some(workflow_id) = &context.workflow_id {
+            self.bind_session_workflow(session_id, workflow_id).await;
             self.record_execution_step(
                 session_id,
-                if terminal { "WORKFLOW_TERMINAL_SKIP" } else { "WORKFLOW_ENQUEUED" },
-                serde_json::json!({ "workflow_id": workflow_id, "step": workflow_step.clone() }),
+                "WORKFLOW_STEP_COMPLETE",
+                serde_json::json!({ "workflow_id": workflow_id, "step": workflow_step }),
             )
             .await?;
         }
@@ -1924,14 +1920,6 @@ impl ExecutionPipeline {
                 }
             }
         });
-    }
-
-    async fn is_workflow_terminal(&self, workflow_id: &str) -> bool {
-        let workflows = self.workflows.read().await;
-        workflows
-            .get(workflow_id)
-            .map(|r| matches!(r.status.as_str(), "completed" | "cancelled"))
-            .unwrap_or(false)
     }
 
     pub async fn advance_workflow_step(
