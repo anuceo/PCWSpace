@@ -56,24 +56,25 @@ fn diff_recursive(path: &str, prev: &Value, next: &Value, ops: &mut Vec<Op>) -> 
 }
 
 fn handle_array_diff(path: &str, prev: &[Value], next: &[Value], ops: &mut Vec<Op>) -> Result<()> {
-    let min_len = prev.len().min(next.len());
-
-    for i in 0..min_len {
-        diff_recursive(&format!("{path}[{i}]"), &prev[i], &next[i], ops)?;
-    }
-
-    if next.len() > prev.len() {
-        for item in next.iter().skip(prev.len()) {
-            ops.push(Op::new(path.to_owned(), OpType::Append, Some(item.clone())));
-        }
-    }
-
     if prev.len() > next.len() {
+        // Array shrank: emit a single Replace for the whole array. Emitting
+        // per-element diffs alongside the Replace would cause nested Append ops
+        // to be applied twice (the Replace already installs the correct value).
         ops.push(Op::new(
             path.to_owned(),
             OpType::Replace,
             Some(Value::Array(next.to_vec())),
         ));
+        return Ok(());
+    }
+
+    let min_len = prev.len().min(next.len());
+    for i in 0..min_len {
+        diff_recursive(&format!("{path}[{i}]"), &prev[i], &next[i], ops)?;
+    }
+
+    for item in next.iter().skip(prev.len()) {
+        ops.push(Op::new(path.to_owned(), OpType::Append, Some(item.clone())));
     }
 
     Ok(())

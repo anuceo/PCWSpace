@@ -166,49 +166,43 @@ fn append_value_at_path(root: &mut Value, path: &str, value: Option<Value>) -> R
 }
 
 fn parse_path(path: &str) -> Result<Vec<PathToken>> {
-    if path.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    if path == "root" {
+    if path.trim().is_empty() || path == "root" {
         return Ok(Vec::new());
     }
     if !path.starts_with("root") {
         bail!("path must start with 'root'");
     }
 
+    let bytes = path.as_bytes();
     let mut tokens = Vec::new();
-    let chars = path.chars().collect::<Vec<_>>();
-    let mut i = 4;
-    while i < chars.len() {
-        match chars[i] {
-            '.' => {
+    let mut i = 4; // skip "root"
+    while i < bytes.len() {
+        match bytes[i] {
+            b'.' => {
                 i += 1;
                 let start = i;
-                while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
+                while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'[' {
                     i += 1;
                 }
                 if start == i {
                     bail!("empty key segment in path");
                 }
-                let key = chars[start..i].iter().collect::<String>();
-                tokens.push(PathToken::Key(key));
+                tokens.push(PathToken::Key(path[start..i].to_owned()));
             }
-            '[' => {
+            b'[' => {
                 i += 1;
                 let start = i;
-                while i < chars.len() && chars[i] != ']' {
+                while i < bytes.len() && bytes[i] != b']' {
                     i += 1;
                 }
-                if i >= chars.len() || chars[i] != ']' {
+                if i >= bytes.len() {
                     bail!("unterminated index segment");
                 }
-                let idx = chars[start..i]
-                    .iter()
-                    .collect::<String>()
+                let idx = path[start..i]
                     .parse::<usize>()
                     .map_err(|_| anyhow!("invalid array index"))?;
                 tokens.push(PathToken::Index(idx));
-                i += 1;
+                i += 1; // skip ']'
             }
             _ => bail!("invalid path token"),
         }

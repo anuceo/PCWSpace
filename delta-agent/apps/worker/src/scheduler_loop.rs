@@ -4,6 +4,30 @@ use serde_json::Value;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn, Level};
 
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let sigterm = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let sigterm = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => { info!("received Ctrl+C, worker shutting down"); }
+        _ = sigterm => { info!("received SIGTERM, worker shutting down"); }
+    }
+}
+
 use crate::config::WorkerConfig;
 
 pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
@@ -24,6 +48,8 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     );
 
     let poll_interval = Duration::from_millis(config.poll_interval_ms);
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
         let mut workflow_executed = 0usize;
@@ -62,11 +88,15 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         } else {
             false
         };
-        info!(
-            workflow_executed,
-            notion_executed, "worker loop tick complete"
-        );
-        sleep(poll_interval).await;
+        info!(workflow_executed, notion_executed, "worker loop tick complete");
+
+        tokio::select! {
+            _ = sleep(poll_interval) => {}
+            _ = &mut shutdown => {
+                info!("worker shutdown complete");
+                return Ok(());
+            }
+        }
     }
 }
 

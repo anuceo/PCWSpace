@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,15 +15,16 @@ use axum::{
 };
 use futures_util::stream;
 use serde::Deserialize;
+use tracing::Instrument;
 
 use crate::pipeline::{
     ApiErrorBody, ApiErrorEnvelope, ApiResponseMeta, ArtifactVersionView, ArtifactWriteRequest,
-    BranchAuditResponse, BranchCreateRequest, BranchListResponse, BranchMergeRequest,
-    BranchMergeResponse, BranchSwitchRequest, BranchSwitchResponse, CreateSessionRequest,
-    CreateWorkspaceRequest, DeltashotView, ExecutionTrace, ForceAgentRequest, MessageRecord,
-    NotionSyncExecutionResult, PipelineError, PipelineState, RollbackRequest, SendMessageRequestV1,
-    SessionView, StreamMessageRequestV1, WorkflowExecutionResult, WorkflowStartRequest,
-    WorkflowStepRequest,
+    ArtifactView, BatchMessageRequest, BranchAuditResponse, BranchCreateRequest,
+    BranchListResponse, BranchMergeRequest, BranchMergeResponse, BranchSwitchRequest,
+    BranchSwitchResponse, CreateSessionRequest, CreateWorkspaceRequest, DeltashotView,
+    ExecutionTrace, ForceAgentRequest, NotionSyncExecutionResult, PipelineError, PipelineState,
+    RollbackRequest, SendMessageRequestV1, SessionView, StreamMessageRequestV1, WorkflowDlqResponse,
+    WorkflowExecutionResult, WorkflowQueueDepthResponse, WorkflowStartRequest, WorkflowStepRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +37,24 @@ struct WorkspaceSessionQuery {
 struct SessionMessagesQuery {
     limit: Option<usize>,
     cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionSearchQuery {
+    workspace_id: Option<String>,
+    created_after: Option<u64>,
+    status: Option<String>,
+    limit: Option<usize>,
+    cursor: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactSearchQuery {
+    session_id: Option<String>,
+    #[serde(rename = "type")]
+    artifact_type: Option<String>,
+    limit: Option<usize>,
+    cursor: Option<u64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -51,6 +71,7 @@ struct ExecuteNextNotionEnvelope {
 
 pub fn router() -> Router<Arc<PipelineState>> {
     Router::new()
+        .route("/sessions", get(search_sessions))
         .route("/workspaces", post(create_workspace))
         .route("/workspaces/{workspaceId}", get(get_workspace))
         .route(
@@ -61,12 +82,13 @@ pub fn router() -> Router<Arc<PipelineState>> {
         .route("/sessions/{sessionId}", get(get_session))
         .route("/sessions/{sessionId}/", get(get_session))
         .route("/sessions/{sessionId}/messages", post(send_message))
+        .route("/sessions/{sessionId}/messages/batch", post(send_message_batch))
         .route("/sessions/{sessionId}/state", get(get_session_state))
         .route("/sessions/{sessionId}/messages", get(get_session_messages))
         .route("/sessions/{sessionId}/deltashots", get(list_deltashots))
         .route("/sessions/{sessionId}/rollback", post(rollback_session))
         .route("/deltashots/{deltashotId}", get(get_deltashot))
-        .route("/artifacts", post(write_artifact))
+        .route("/artifacts", post(write_artifact).get(search_artifacts))
         .route("/artifacts/{artifactId}", get(get_artifact))
         .route(
             "/artifacts/{artifactId}/versions",
@@ -84,6 +106,10 @@ pub fn router() -> Router<Arc<PipelineState>> {
         )
         .route("/workflows/{workflowId}/state", get(get_workflow_state))
         .route("/workflows/{workflowId}/step", post(advance_workflow_step))
+        .route("/workflows/{workflowId}/complete", post(complete_workflow))
+        .route("/workflows/{workflowId}/cancel", post(cancel_workflow))
+        .route("/workflows/queue/depth", get(get_workflow_queue_depth))
+        .route("/workflows/failed", get(get_workflow_dlq))
         .route("/sessions/{sessionId}/agent", post(force_agent_selection))
         .route("/sessions/{sessionId}/agents/logs", get(get_agent_logs))
         .route("/sessions/{sessionId}/trace", get(get_trace))
@@ -91,10 +117,10 @@ pub fn router() -> Router<Arc<PipelineState>> {
             "/debug/sessions/{sessionId}/branches/{branchId}/audit",
             post(run_branch_audit),
         )
-        .route("/sessions/{sessionId}/branch", post(create_branch))
+        .route("/sessions/{sessionId}/branches", post(create_branch))
         .route("/sessions/{sessionId}/branches", get(list_branches))
-        .route("/sessions/{sessionId}/branch/switch", post(switch_branch))
-        .route("/sessions/{sessionId}/branch/merge", post(merge_branch))
+        .route("/sessions/{sessionId}/branches/switch", post(switch_branch))
+        .route("/sessions/{sessionId}/branches/merge", post(merge_branch))
         .route(
             "/sessions/{sessionId}/messages/stream",
             post(stream_message),
@@ -186,10 +212,9 @@ async fn get_session_messages(
     let limit = query.limit.unwrap_or(50);
     let cursor = query.cursor;
     with_meta(async move {
-        let data = state
+        state
             .get_session_messages(&session_id, limit, cursor)
-            .await?;
-        Ok::<Vec<MessageRecord>, PipelineError>(data)
+            .await
     })
     .await
 }
@@ -230,6 +255,36 @@ async fn write_artifact(
     Json(request): Json<ArtifactWriteRequest>,
 ) -> impl IntoResponse {
     with_meta(async move { state.create_or_update_artifact_api(request).await }).await
+}
+
+async fn search_artifacts(
+    Query(query): Query<ArtifactSearchQuery>,
+    Query(all_params): Query<HashMap<String, String>>,
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(20);
+    // Extract tag filters from bracket notation: tag[key]=value
+    let tags: HashMap<String, String> = all_params
+        .iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("tag[")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .map(|tag_key| (tag_key.to_owned(), v.clone()))
+        })
+        .collect();
+    with_meta(async move {
+        let results = state
+            .search_artifacts(
+                query.session_id.as_deref(),
+                query.artifact_type.as_deref(),
+                &tags,
+                limit,
+                query.cursor,
+            )
+            .await;
+        Ok::<Vec<ArtifactView>, PipelineError>(results)
+    })
+    .await
 }
 
 async fn get_artifact(
@@ -412,6 +467,69 @@ async fn merge_branch(
     .await
 }
 
+async fn complete_workflow(
+    Path(workflow_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    with_meta(async move { state.terminate_workflow(&workflow_id, "completed").await }).await
+}
+
+async fn cancel_workflow(
+    Path(workflow_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    with_meta(async move { state.terminate_workflow(&workflow_id, "cancelled").await }).await
+}
+
+async fn get_workflow_queue_depth(
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    with_meta(async move {
+        Ok::<WorkflowQueueDepthResponse, PipelineError>(state.workflow_queue_depth().await)
+    })
+    .await
+}
+
+async fn get_workflow_dlq(State(state): State<Arc<PipelineState>>) -> impl IntoResponse {
+    with_meta(async move {
+        Ok::<WorkflowDlqResponse, PipelineError>(state.get_workflow_dlq().await)
+    })
+    .await
+}
+
+async fn search_sessions(
+    Query(query): Query<SessionSearchQuery>,
+    State(state): State<Arc<PipelineState>>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(20);
+    with_meta(async move {
+        let sessions = state
+            .search_sessions(
+                query.workspace_id.as_deref(),
+                query.created_after,
+                query.status.as_deref(),
+                limit,
+                query.cursor,
+            )
+            .await;
+        Ok::<Vec<SessionView>, PipelineError>(sessions)
+    })
+    .await
+}
+
+async fn send_message_batch(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<PipelineState>>,
+    Json(request): Json<BatchMessageRequest>,
+) -> impl IntoResponse {
+    with_meta(async move {
+        state
+            .handle_message_batch(&session_id, request)
+            .await
+    })
+    .await
+}
+
 async fn stream_message(
     Path(session_id): Path<String>,
     State(state): State<Arc<PipelineState>>,
@@ -446,7 +564,8 @@ where
     let started = Instant::now();
     let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
     let now = now_ms();
-    match fut.await {
+    let span = tracing::info_span!("http.request", request_id = %request_id);
+    match fut.instrument(span).await {
         Ok(data) => {
             let payload = serde_json::to_value(data).unwrap_or_else(|_| serde_json::json!({}));
             let meta = serde_json::to_value(ApiResponseMeta {

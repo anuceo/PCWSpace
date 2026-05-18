@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -41,12 +41,14 @@ const SESSION_LOCK_TTL_SECS: u64 = 5;
 const SESSION_LOCK_RETRIES: usize = 3;
 const LOCK_RETRY_DELAY_MS: u64 = 40;
 const STREAM_IDEMPOTENCY_TTL_SECS: u64 = 60 * 60;
+const MAX_IDEMPOTENT_CACHE_ENTRIES: usize = 1_024;
 const EVENT_TYPE_EXECUTION_STEP: &str = "EXECUTION_STEP";
 const MAIN_BRANCH_ID: &str = "br_main";
 const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com/v1";
 const DEFAULT_NOTION_API_VERSION: &str = "2022-06-28";
 const DEFAULT_NOTION_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_NOTION_MAX_ATTEMPTS: u32 = 3;
+const MAX_WORKFLOW_JOB_ATTEMPTS: u32 = 3;
 
 static PIPELINE: OnceLock<ExecutionPipeline> = OnceLock::new();
 
@@ -123,6 +125,8 @@ pub struct ArtifactWriteRequest {
     pub content: String,
     #[serde(default)]
     pub metadata: Value,
+    #[serde(default)]
+    pub tags: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +135,8 @@ pub struct WorkflowStartRequest {
     pub workflow_id: String,
     #[serde(default)]
     pub input: Value,
+    #[serde(default)]
+    pub callback_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +217,7 @@ pub struct SessionView {
     pub status: String,
     pub workflow_id: Option<String>,
     pub state_version: u64,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -284,6 +291,30 @@ pub struct MessageRecord {
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionMessagesResponse {
     pub messages: Vec<MessageRecord>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchMessageRequest {
+    pub messages: Vec<SendMessageRequestV1>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchMessageItemResult {
+    pub index: usize,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<SendMessageResponseV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchMessageResponse {
+    pub results: Vec<BatchMessageItemResult>,
+    pub succeeded: usize,
+    pub failed: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -328,6 +359,7 @@ pub struct ArtifactView {
     pub artifact_type: String,
     pub current_version: u64,
     pub created_at: u64,
+    pub tags: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -345,6 +377,33 @@ pub struct WorkflowExecutionResult {
     pub step: String,
     pub deltashot_id: String,
     pub state_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowQueueDepthResponse {
+    pub depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowTerminateResponse {
+    pub workflow_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FailedWorkflowJob {
+    pub workflow_id: String,
+    pub session_id: String,
+    pub step: String,
+    pub attempt: u32,
+    pub failed_at: u64,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowDlqResponse {
+    pub jobs: Vec<FailedWorkflowJob>,
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -663,6 +722,7 @@ struct ArtifactRecord {
     created_at: u64,
     current_version: u64,
     versions: BTreeMap<u64, String>,
+    tags: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -672,6 +732,7 @@ struct WorkflowRecord {
     status: String,
     current_step: String,
     updated_at: u64,
+    callback_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -810,6 +871,14 @@ struct ArtifactWriteOutcome {
 // Section 2: Pipeline state + initialization
 // ==========================================================
 
+struct LazyRepo(TokioOnceCell<RedisVddabRepository>);
+
+impl std::fmt::Debug for LazyRepo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LazyRepo(..)")
+    }
+}
+
 #[derive(Debug)]
 pub struct ExecutionPipeline {
     agent_runtime_config: AgentRuntimeConfig,
@@ -824,12 +893,14 @@ pub struct ExecutionPipeline {
     deltashots: RwLock<HashMap<String, DeltashotRecord>>,
     artifacts: RwLock<HashMap<String, ArtifactRecord>>,
     workflows: RwLock<HashMap<String, WorkflowRecord>>,
-    workflow_queue: Mutex<Vec<WorkflowJob>>,
+    workflow_queue: Mutex<VecDeque<WorkflowJob>>,
+    workflow_dlq: Mutex<VecDeque<FailedWorkflowJob>>,
     agent_logs: RwLock<HashMap<String, Vec<AgentLogEntry>>>,
-    notion_queue: Mutex<Vec<NotionSyncJob>>,
+    notion_queue: Mutex<VecDeque<NotionSyncJob>>,
     locks: Mutex<HashMap<String, (String, Instant)>>,
     idempotent_streams: Mutex<HashMap<String, Vec<StreamEventEnvelope>>>,
     persistence_hydration: TokioOnceCell<()>,
+    persistence_repo: LazyRepo,
 }
 
 pub type PipelineState = ExecutionPipeline;
@@ -865,12 +936,14 @@ impl ExecutionPipeline {
             deltashots: RwLock::new(HashMap::new()),
             artifacts: RwLock::new(HashMap::new()),
             workflows: RwLock::new(HashMap::new()),
-            workflow_queue: Mutex::new(Vec::new()),
+            workflow_queue: Mutex::new(VecDeque::new()),
+            workflow_dlq: Mutex::new(VecDeque::new()),
             agent_logs: RwLock::new(HashMap::new()),
-            notion_queue: Mutex::new(Vec::new()),
+            notion_queue: Mutex::new(VecDeque::new()),
             locks: Mutex::new(HashMap::new()),
             idempotent_streams: Mutex::new(HashMap::new()),
             persistence_hydration: TokioOnceCell::new(),
+            persistence_repo: LazyRepo(TokioOnceCell::new()),
         })
     }
 
@@ -950,6 +1023,7 @@ impl ExecutionPipeline {
                     status: record.status.clone(),
                     workflow_id: record.workflow_id.clone(),
                     state_version: record.state.version,
+                    created_at: record.created_at,
                 })
             })
             .collect::<Vec<_>>()
@@ -1043,6 +1117,7 @@ impl ExecutionPipeline {
             status: session.status.clone(),
             workflow_id: session.workflow_id.clone(),
             state_version: session.state.version,
+            created_at: session.created_at,
         })
     }
 
@@ -1065,6 +1140,14 @@ impl ExecutionPipeline {
     ) -> Result<SendMessageResponseV1, PipelineError> {
         self.ensure_persistence_hydrated().await;
         self.ensure_session_exists(session_id).await?;
+
+        if request.content.trim().is_empty() {
+            return Err(PipelineError::InvalidInput(
+                "message content cannot be empty".to_owned(),
+            ));
+        }
+
+        let lock_handle = self.acquire_session_lock(session_id).await?;
         self.record_execution_step(
             session_id,
             "API_ENTRY",
@@ -1073,16 +1156,8 @@ impl ExecutionPipeline {
             }),
         )
         .await?;
-
-        if request.content.trim().is_empty() {
-            return Err(PipelineError::InvalidInput(
-                "message content cannot be empty".to_owned(),
-            ));
-        }
-
         self.record_execution_step(session_id, "SESSION_HYDRATE_START", Value::Null)
             .await?;
-        let lock_handle = self.acquire_session_lock(session_id).await?;
         self.record_execution_step(
             session_id,
             "LOCK_ACQUIRED",
@@ -1247,26 +1322,25 @@ impl ExecutionPipeline {
         self.record_execution_step(session_id, "STATE_PERSISTED", Value::Null)
             .await?;
 
+        // workflow_step and workflow_active are used in the response envelope below.
+        // Re-enqueueing is NOT done here — it is the responsibility of the caller:
+        // start_workflow() seeds the first job; advance_workflow_step() pushes
+        // subsequent ones. Auto-requeueing after every execution causes an unbound
+        // execution storm (job → re-enqueue → job → …).
         let workflow_step = next_state
             .step
             .clone()
-            .unwrap_or_else(|| "continue".to_owned());
+            .unwrap_or_else(|| "idle".to_owned());
         let workflow_active =
             matches!(request.mode, MessageMode::Workflow | MessageMode::Execution)
                 || context.workflow_id.is_some();
 
-        if workflow_active {
-            let workflow_id = context
-                .workflow_id
-                .clone()
-                .unwrap_or_else(|| format!("wf-{}", session_id));
-            self.enqueue_workflow(&workflow_id, session_id, &workflow_step, Value::Null)
-                .await;
-            self.bind_session_workflow(session_id, &workflow_id).await;
+        if let Some(workflow_id) = &context.workflow_id {
+            self.bind_session_workflow(session_id, workflow_id).await;
             self.record_execution_step(
                 session_id,
-                "WORKFLOW_ENQUEUED",
-                serde_json::json!({ "workflow_id": workflow_id, "step": workflow_step.clone() }),
+                "WORKFLOW_STEP_COMPLETE",
+                serde_json::json!({ "workflow_id": workflow_id, "step": workflow_step }),
             )
             .await?;
         }
@@ -1345,7 +1419,7 @@ impl ExecutionPipeline {
         session_id: &str,
         limit: usize,
         cursor: Option<String>,
-    ) -> Result<Vec<MessageRecord>, PipelineError> {
+    ) -> Result<SessionMessagesResponse, PipelineError> {
         let sessions = self.sessions.read().await;
         let Some(session) = sessions.get(session_id) else {
             return Err(PipelineError::NotFound(format!(
@@ -1355,23 +1429,130 @@ impl ExecutionPipeline {
         };
 
         let mut messages = session.messages.clone();
-        if let Some(cursor_id) = cursor {
-            if let Some(index) = messages.iter().position(|m| m.id == cursor_id) {
+        if let Some(cursor_id) = &cursor {
+            if let Some(index) = messages.iter().position(|m| &m.id == cursor_id) {
                 messages.truncate(index);
             }
         }
 
-        Ok(messages
+        let capped = limit.max(1);
+        let has_more = messages.len() > capped;
+        let page = messages
             .into_iter()
             .rev()
-            .take(limit.max(1))
+            .take(capped)
             .map(|m| MessageRecord {
                 id: m.id,
                 role: m.role,
                 content: m.content,
                 timestamp: m.timestamp,
             })
-            .collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        let next_cursor = if has_more {
+            page.last().map(|m| m.id.clone())
+        } else {
+            None
+        };
+
+        Ok(SessionMessagesResponse {
+            messages: page,
+            has_more,
+            next_cursor,
+        })
+    }
+
+    pub async fn handle_message_batch(
+        &self,
+        session_id: &str,
+        request: BatchMessageRequest,
+    ) -> Result<BatchMessageResponse, PipelineError> {
+        self.ensure_session_exists(session_id).await?;
+        if request.messages.is_empty() {
+            return Err(PipelineError::InvalidInput(
+                "batch must contain at least one message".to_owned(),
+            ));
+        }
+        let mut results = Vec::with_capacity(request.messages.len());
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        for (index, msg) in request.messages.into_iter().enumerate() {
+            match self.handle_message_v1(session_id, msg).await {
+                Ok(response) => {
+                    succeeded += 1;
+                    results.push(BatchMessageItemResult {
+                        index,
+                        ok: true,
+                        response: Some(response),
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    failed += 1;
+                    results.push(BatchMessageItemResult {
+                        index,
+                        ok: false,
+                        response: None,
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
+        }
+        Ok(BatchMessageResponse { results, succeeded, failed })
+    }
+
+    pub async fn search_sessions(
+        &self,
+        workspace_id: Option<&str>,
+        created_after: Option<u64>,
+        status: Option<&str>,
+        limit: usize,
+        cursor: Option<u64>,
+    ) -> Vec<SessionView> {
+        let limit = limit.max(1).min(200);
+
+        let candidate_ids: Option<Vec<String>> = if let Some(wid) = workspace_id {
+            let idx = self.workspace_sessions.read().await;
+            Some(
+                idx.get(wid)
+                    .map(|v| v.iter().map(|(_, sid)| sid.clone()).collect())
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
+
+        let sessions = self.sessions.read().await;
+
+        let records: Vec<&SessionRecord> = match &candidate_ids {
+            Some(ids) => ids.iter().filter_map(|id| sessions.get(id.as_str())).collect(),
+            None => sessions.values().collect(),
+        };
+
+        let mut views: Vec<(u64, SessionView)> = records
+            .into_iter()
+            .filter(|r| {
+                created_after.map_or(true, |ts| r.created_at > ts)
+                    && status.map_or(true, |s| r.status == s)
+                    && cursor.map_or(true, |ts| r.created_at < ts)
+            })
+            .map(|r| {
+                (
+                    r.created_at,
+                    SessionView {
+                        session_id: r.session_id.clone(),
+                        status: r.status.clone(),
+                        workflow_id: r.workflow_id.clone(),
+                        state_version: r.state.version,
+                        created_at: r.created_at,
+                    },
+                )
+            })
+            .collect();
+
+        views.sort_by(|(a, _), (b, _)| b.cmp(a));
+        views.truncate(limit);
+        views.into_iter().map(|(_, v)| v).collect()
     }
 
     pub async fn list_deltashots(
@@ -1470,8 +1651,19 @@ impl ExecutionPipeline {
                 session.hashchain.truncate(target_index + 1);
             }
             sync_active_branch_from_session(session);
+            let active_branch_id = session.active_branch_id.clone();
+            let truncated_chain = session.deltashot_ids.clone();
 
             drop(sessions);
+
+            if mode == "hard" {
+                self.persist_branch_chain_truncation(
+                    session_id,
+                    &active_branch_id,
+                    &truncated_chain,
+                )
+                .await;
+            }
 
             let rollback_ops = state_ops_from_states(&prev_state, &rebuilt_state);
             self.append_event(session_id, "ROLLBACK", ops_to_diff_value(&rollback_ops))
@@ -1527,6 +1719,12 @@ impl ExecutionPipeline {
                 &request.content,
             )
             .await?;
+        if let Some(tags) = request.tags {
+            let mut artifacts = self.artifacts.write().await;
+            if let Some(record) = artifacts.get_mut(&outcome.envelope.artifact_id) {
+                record.tags = tags;
+            }
+        }
         Ok(outcome.envelope)
     }
 
@@ -1539,7 +1737,49 @@ impl ExecutionPipeline {
             artifact_type: record.artifact_type.clone(),
             current_version: record.current_version,
             created_at: record.created_at,
+            tags: record.tags.clone(),
         })
+    }
+
+    pub async fn search_artifacts(
+        &self,
+        session_id: Option<&str>,
+        artifact_type: Option<&str>,
+        tags: &HashMap<String, String>,
+        limit: usize,
+        cursor: Option<u64>,
+    ) -> Vec<ArtifactView> {
+        let limit = limit.max(1).min(200);
+        let artifacts = self.artifacts.read().await;
+
+        let mut views: Vec<(u64, ArtifactView)> = artifacts
+            .values()
+            .filter(|r| {
+                session_id.map_or(true, |s| r.session_id == s)
+                    && artifact_type.map_or(true, |t| r.artifact_type == t)
+                    && cursor.map_or(true, |ts| r.created_at < ts)
+                    && tags
+                        .iter()
+                        .all(|(k, v)| r.tags.get(k).map_or(false, |rv| rv == v))
+            })
+            .map(|r| {
+                (
+                    r.created_at,
+                    ArtifactView {
+                        artifact_id: r.artifact_id.clone(),
+                        session_id: r.session_id.clone(),
+                        artifact_type: r.artifact_type.clone(),
+                        current_version: r.current_version,
+                        created_at: r.created_at,
+                        tags: r.tags.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        views.sort_by(|(a, _), (b, _)| b.cmp(a));
+        views.truncate(limit);
+        views.into_iter().map(|(_, v)| v).collect()
     }
 
     pub async fn get_artifact_versions(&self, artifact_id: &str) -> Vec<ArtifactVersionView> {
@@ -1584,6 +1824,7 @@ impl ExecutionPipeline {
             status: "active".to_owned(),
             current_step: "start".to_owned(),
             updated_at: now,
+            callback_url: request.callback_url.filter(|u| !u.is_empty()),
         };
 
         {
@@ -1619,6 +1860,66 @@ impl ExecutionPipeline {
             session_id: Some(record.session_id.clone()),
             current_step: record.current_step.clone(),
         })
+    }
+
+    pub async fn terminate_workflow(
+        &self,
+        workflow_id: &str,
+        terminal_status: &str,
+    ) -> Result<WorkflowTerminateResponse, PipelineError> {
+        self.ensure_persistence_hydrated().await;
+        let snapshot = {
+            let mut workflows = self.workflows.write().await;
+            let record = workflows.get_mut(workflow_id).ok_or_else(|| {
+                PipelineError::NotFound(format!("workflow '{}' not found", workflow_id))
+            })?;
+            record.status = terminal_status.to_owned();
+            record.updated_at = now_ms();
+            record.clone()
+        };
+        self.persist_workflow_record(&snapshot).await;
+        if let Some(url) = snapshot.callback_url {
+            self.fire_workflow_callback(workflow_id, terminal_status, &url)
+                .await;
+        }
+        Ok(WorkflowTerminateResponse {
+            workflow_id: workflow_id.to_owned(),
+            status: terminal_status.to_owned(),
+        })
+    }
+
+    pub async fn workflow_queue_depth(&self) -> WorkflowQueueDepthResponse {
+        let queue = self.workflow_queue.lock().await;
+        WorkflowQueueDepthResponse { depth: queue.len() }
+    }
+
+    pub async fn get_workflow_dlq(&self) -> WorkflowDlqResponse {
+        let dlq = self.workflow_dlq.lock().await;
+        let jobs: Vec<FailedWorkflowJob> = dlq.iter().cloned().collect();
+        let total = jobs.len();
+        WorkflowDlqResponse { jobs, total }
+    }
+
+    async fn fire_workflow_callback(&self, workflow_id: &str, status: &str, url: &str) {
+        let client = self.notion_http_client.clone();
+        let url = url.to_owned();
+        let wid = workflow_id.to_owned();
+        let status = status.to_owned();
+        tokio::spawn(async move {
+            let payload = serde_json::json!({
+                "workflow_id": wid,
+                "status": status,
+                "fired_at": now_ms(),
+            });
+            match client.post(&url).json(&payload).send().await {
+                Ok(resp) => {
+                    info!(workflow_id = %wid, http_status = %resp.status(), "workflow callback delivered");
+                }
+                Err(err) => {
+                    warn!(workflow_id = %wid, error = %err, "workflow callback delivery failed");
+                }
+            }
+        });
     }
 
     pub async fn advance_workflow_step(
@@ -1688,10 +1989,28 @@ impl ExecutionPipeline {
                 }))
             }
             Err(error) => {
-                if matches!(error, PipelineError::LockUnavailable) {
+                let next_attempt = job.attempt.saturating_add(1);
+                if matches!(error, PipelineError::LockUnavailable)
+                    || next_attempt < MAX_WORKFLOW_JOB_ATTEMPTS
+                {
                     self.requeue_workflow_job(job, source).await;
                 } else {
                     self.ack_workflow_job_if_needed(&job, source).await;
+                    let failed = FailedWorkflowJob {
+                        workflow_id: job.workflow_id.clone(),
+                        session_id: job.session_id.clone(),
+                        step: job.step.clone(),
+                        attempt: job.attempt,
+                        failed_at: now_ms(),
+                        error: error.to_string(),
+                    };
+                    warn!(
+                        workflow_id = %failed.workflow_id,
+                        attempt = failed.attempt,
+                        error = %failed.error,
+                        "workflow job exhausted retries, moving to dead-letter queue"
+                    );
+                    self.workflow_dlq.lock().await.push_back(failed);
                 }
                 Err(error)
             }
@@ -1856,7 +2175,7 @@ impl ExecutionPipeline {
         }
 
         let mut queue = self.notion_queue.lock().await;
-        queue.push(job.clone());
+        queue.push_back(job.clone());
         info!(
             session_id = %job.session_id,
             attempt = job.attempt,
@@ -2034,19 +2353,24 @@ impl ExecutionPipeline {
 
     async fn persistence_backend(&self) -> Option<RedisVddabRepository> {
         let config = self.persistence.as_ref()?;
-        match RedisVddabRepository::connect(
-            &config.redis_url,
-            self.keyspace.clone(),
-            &config.vddab_root,
-        )
-        .await
-        {
-            Ok(repo) => Some(repo),
-            Err(err) => {
+        let repo = self
+            .persistence_repo
+            .0
+            .get_or_try_init(|| async {
+                RedisVddabRepository::connect(
+                    &config.redis_url,
+                    self.keyspace.clone(),
+                    &config.vddab_root,
+                )
+                .await
+            })
+            .await
+            .map_err(|err| {
                 warn!(error = %err, "failed to initialize persistence backend");
-                None
-            }
-        }
+                err
+            })
+            .ok()?;
+        Some(repo.clone())
     }
 
     async fn ensure_persistence_hydrated(&self) {
@@ -2324,6 +2648,7 @@ impl ExecutionPipeline {
                                 created_at: record.created_at,
                                 current_version: record.current_version,
                                 versions,
+                                tags: HashMap::new(),
                             },
                         );
                         branch_artifacts
@@ -2399,6 +2724,7 @@ impl ExecutionPipeline {
                             status: workflow.status,
                             current_step: workflow.current_step,
                             updated_at: workflow.updated_at,
+                            callback_url: None,
                         },
                     );
                 }
@@ -2470,6 +2796,28 @@ impl ExecutionPipeline {
                     branch_id = %branch_id,
                     error = %err,
                     "failed to persist active branch pointer"
+                );
+            }
+        }
+    }
+
+    async fn persist_branch_chain_truncation(
+        &self,
+        session_id: &str,
+        branch_id: &str,
+        remaining_ids: &[String],
+    ) {
+        if let Some(repo) = self.persistence_backend().await {
+            let storage_branch_id = persistence_branch_key(session_id, branch_id);
+            if let Err(err) = repo
+                .replace_branch_chain(&storage_branch_id, remaining_ids)
+                .await
+            {
+                warn!(
+                    session_id = %session_id,
+                    branch_id = %branch_id,
+                    error = %err,
+                    "failed to persist branch chain truncation"
                 );
             }
         }
@@ -2879,11 +3227,10 @@ impl ExecutionPipeline {
         &self,
         session_id: &str,
     ) -> Result<BranchListResponse, PipelineError> {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions.get_mut(session_id).ok_or_else(|| {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(session_id).ok_or_else(|| {
             PipelineError::NotFound(format!("session '{}' not found", session_id))
         })?;
-        ensure_session_branches(session);
 
         let mut branches = session
             .branches
@@ -2895,8 +3242,11 @@ impl ExecutionPipeline {
             })
             .collect::<Vec<_>>();
 
-        branches.sort_by(|a, b| a.branch_id.cmp(&b.branch_id));
-        branches.sort_by_key(|entry| std::cmp::Reverse(entry.is_main));
+        branches.sort_by(|a, b| {
+            b.is_main
+                .cmp(&a.is_main)
+                .then_with(|| a.branch_id.cmp(&b.branch_id))
+        });
 
         Ok(BranchListResponse { branches })
     }
@@ -3568,6 +3918,9 @@ impl ExecutionPipeline {
     async fn store_cached_stream_events(&self, cache_key: &str, events: &[StreamEventEnvelope]) {
         if self.persistence.is_none() {
             let mut cache = self.idempotent_streams.lock().await;
+            if cache.len() >= MAX_IDEMPOTENT_CACHE_ENTRIES && !cache.contains_key(cache_key) {
+                return;
+            }
             cache.insert(cache_key.to_owned(), events.to_vec());
             return;
         }
@@ -3704,12 +4057,11 @@ impl ExecutionPipeline {
         artifact_type: &str,
         content: &str,
     ) -> Result<ArtifactWriteOutcome, PipelineError> {
+        let mut sessions = self.sessions.write().await;
         let (active_branch_id, branch_artifact_ids) = {
-            let mut sessions = self.sessions.write().await;
             let session = sessions.get_mut(session_id).ok_or_else(|| {
                 PipelineError::NotFound(format!("session '{}' not found", session_id))
-            });
-            let session = session?;
+            })?;
             ensure_session_branches(session);
             (session.active_branch_id.clone(), session.artifacts.clone())
         };
@@ -3776,6 +4128,7 @@ impl ExecutionPipeline {
                         created_at: now_ms(),
                         current_version: 1,
                         versions,
+                        tags: HashMap::new(),
                     },
                 );
                 (new_id, artifact_type.to_owned(), 1, None)
@@ -3785,7 +4138,6 @@ impl ExecutionPipeline {
         drop(artifacts);
 
         {
-            let mut sessions = self.sessions.write().await;
             let session = sessions.get_mut(session_id).ok_or_else(|| {
                 PipelineError::NotFound(format!("session '{}' not found", session_id))
             })?;
@@ -3796,6 +4148,7 @@ impl ExecutionPipeline {
             session.artifacts.insert(artifact_id.clone());
             sync_active_branch_from_session(session);
         }
+        drop(sessions);
         if let Some(record) = artifact_snapshot.as_ref() {
             self.persist_artifact_record(record).await;
         }
@@ -3849,7 +4202,7 @@ impl ExecutionPipeline {
         };
         if !self.enqueue_workflow_durable(&job).await {
             let mut queue = self.workflow_queue.lock().await;
-            queue.push(job);
+            queue.push_back(job);
         }
 
         let workflow_record = {
@@ -3860,6 +4213,7 @@ impl ExecutionPipeline {
                 status: "active".to_owned(),
                 current_step: step.to_owned(),
                 updated_at: now,
+                callback_url: None,
             };
             workflows.insert(workflow_id.to_owned(), record.clone());
             record
@@ -3908,11 +4262,7 @@ impl ExecutionPipeline {
         }
 
         let mut queue = self.workflow_queue.lock().await;
-        let next = if queue.is_empty() {
-            None
-        } else {
-            Some(queue.remove(0))
-        };
+        let next = queue.pop_front();
         (next, WorkflowJobSource::InMemory)
     }
 
@@ -3931,7 +4281,7 @@ impl ExecutionPipeline {
             );
         }
         let mut queue = self.workflow_queue.lock().await;
-        queue.push(job);
+        queue.push_back(job);
     }
 
     async fn enqueue_workflow_durable(&self, job: &WorkflowJob) -> bool {
@@ -3978,11 +4328,7 @@ impl ExecutionPipeline {
             }
         }
         let mut queue = self.notion_queue.lock().await;
-        let next = if queue.is_empty() {
-            None
-        } else {
-            Some(queue.remove(0))
-        };
+        let next = queue.pop_front();
         (next, WorkflowJobSource::InMemory)
     }
 
@@ -4120,7 +4466,7 @@ impl ExecutionPipeline {
             return true;
         }
         let mut queue = self.notion_queue.lock().await;
-        queue.push(job);
+        queue.push_back(job);
         info!(session_id = %session_id, "notion sync enqueued in-memory");
         true
     }
@@ -4507,7 +4853,7 @@ fn apply_state_mutation(
     output: &AgentOutput,
 ) -> SessionState {
     let mut next = prev.clone();
-    next.version = prev.version + 1;
+    next.version = prev.version.saturating_add(1);
     next.last_user_message = Some(user_input.to_owned());
     next.last_agent_message = Some(output.text.clone());
     next.goal = output.proposed_goal.clone().or_else(|| prev.goal.clone());
@@ -4799,8 +5145,10 @@ fn compress_ops(payload: &[u8]) -> Vec<u8> {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock should be after epoch")
-        .as_millis() as u64
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

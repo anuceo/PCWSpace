@@ -1,3 +1,5 @@
+use tracing::debug;
+
 use crate::bus::{EventBus, StreamEvent};
 
 #[derive(Debug, Clone)]
@@ -11,9 +13,12 @@ impl Publisher {
     }
 
     pub fn publish(&self, topic: impl Into<String>, payload: impl Into<String>) {
-        let _ = self.bus.publish(StreamEvent {
+        let event = StreamEvent {
             topic: topic.into(),
             payload: payload.into(),
-        });
+        };
+        if let Err(_) = self.bus.publish(event) {
+            debug!("stream event dropped: no active subscribers");
+        }
     }
 }
