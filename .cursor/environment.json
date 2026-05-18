@@ -1,0 +1,14 @@
+{
+  "install": "bash -lc 'set -euo pipefail; mkdir -p /workspace/.cache/cargo-target; cd /workspace; cargo fetch'",
+  "start": "bash -lc 'set -euo pipefail; mkdir -p /workspace/.cache/cargo-target'",
+  "env": {
+    "CARGO_TARGET_DIR": "/workspace/.cache/cargo-target",
+    "RUSTUP_TOOLCHAIN": "stable"
+  },
+  "persistedDirectories": [
+    "/home/ubuntu/.cargo/registry",
+    "/home/ubuntu/.cargo/git",
+    "/home/ubuntu/.rustup",
+    "/workspace/.cache/cargo-target"
+  ]
+}
