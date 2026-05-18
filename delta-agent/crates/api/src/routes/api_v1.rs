@@ -21,8 +21,8 @@ use crate::pipeline::{
     BranchMergeResponse, BranchSwitchRequest, BranchSwitchResponse, CreateSessionRequest,
     CreateWorkspaceRequest, DeltashotView, ExecutionTrace, ForceAgentRequest,
     NotionSyncExecutionResult, PipelineError, PipelineState, RollbackRequest, SendMessageRequestV1,
-    SessionView, StreamMessageRequestV1, WorkflowExecutionResult, WorkflowQueueDepthResponse,
-    WorkflowStartRequest, WorkflowStepRequest,
+    SessionView, StreamMessageRequestV1, WorkflowDlqResponse, WorkflowExecutionResult,
+    WorkflowQueueDepthResponse, WorkflowStartRequest, WorkflowStepRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +87,7 @@ pub fn router() -> Router<Arc<PipelineState>> {
         .route("/workflows/{workflowId}/complete", post(complete_workflow))
         .route("/workflows/{workflowId}/cancel", post(cancel_workflow))
         .route("/workflows/queue/depth", get(get_workflow_queue_depth))
+        .route("/workflows/failed", get(get_workflow_dlq))
         .route("/sessions/{sessionId}/agent", post(force_agent_selection))
         .route("/sessions/{sessionId}/agents/logs", get(get_agent_logs))
         .route("/sessions/{sessionId}/trace", get(get_trace))
@@ -433,6 +434,13 @@ async fn get_workflow_queue_depth(
 ) -> impl IntoResponse {
     with_meta(async move {
         Ok::<WorkflowQueueDepthResponse, PipelineError>(state.workflow_queue_depth().await)
+    })
+    .await
+}
+
+async fn get_workflow_dlq(State(state): State<Arc<PipelineState>>) -> impl IntoResponse {
+    with_meta(async move {
+        Ok::<WorkflowDlqResponse, PipelineError>(state.get_workflow_dlq().await)
     })
     .await
 }

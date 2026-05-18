@@ -48,6 +48,7 @@ const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com/v1";
 const DEFAULT_NOTION_API_VERSION: &str = "2022-06-28";
 const DEFAULT_NOTION_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_NOTION_MAX_ATTEMPTS: u32 = 3;
+const MAX_WORKFLOW_JOB_ATTEMPTS: u32 = 3;
 
 static PIPELINE: OnceLock<ExecutionPipeline> = OnceLock::new();
 
@@ -132,6 +133,8 @@ pub struct WorkflowStartRequest {
     pub workflow_id: String,
     #[serde(default)]
     pub input: Value,
+    #[serde(default)]
+    pub callback_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +362,22 @@ pub struct WorkflowQueueDepthResponse {
 pub struct WorkflowTerminateResponse {
     pub workflow_id: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FailedWorkflowJob {
+    pub workflow_id: String,
+    pub session_id: String,
+    pub step: String,
+    pub attempt: u32,
+    pub failed_at: u64,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowDlqResponse {
+    pub jobs: Vec<FailedWorkflowJob>,
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -686,6 +705,7 @@ struct WorkflowRecord {
     status: String,
     current_step: String,
     updated_at: u64,
+    callback_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -847,6 +867,7 @@ pub struct ExecutionPipeline {
     artifacts: RwLock<HashMap<String, ArtifactRecord>>,
     workflows: RwLock<HashMap<String, WorkflowRecord>>,
     workflow_queue: Mutex<VecDeque<WorkflowJob>>,
+    workflow_dlq: Mutex<VecDeque<FailedWorkflowJob>>,
     agent_logs: RwLock<HashMap<String, Vec<AgentLogEntry>>>,
     notion_queue: Mutex<VecDeque<NotionSyncJob>>,
     locks: Mutex<HashMap<String, (String, Instant)>>,
@@ -889,6 +910,7 @@ impl ExecutionPipeline {
             artifacts: RwLock::new(HashMap::new()),
             workflows: RwLock::new(HashMap::new()),
             workflow_queue: Mutex::new(VecDeque::new()),
+            workflow_dlq: Mutex::new(VecDeque::new()),
             agent_logs: RwLock::new(HashMap::new()),
             notion_queue: Mutex::new(VecDeque::new()),
             locks: Mutex::new(HashMap::new()),
@@ -1636,6 +1658,7 @@ impl ExecutionPipeline {
             status: "active".to_owned(),
             current_step: "start".to_owned(),
             updated_at: now,
+            callback_url: request.callback_url.filter(|u| !u.is_empty()),
         };
 
         {
@@ -1689,6 +1712,10 @@ impl ExecutionPipeline {
             record.clone()
         };
         self.persist_workflow_record(&snapshot).await;
+        if let Some(url) = snapshot.callback_url {
+            self.fire_workflow_callback(workflow_id, terminal_status, &url)
+                .await;
+        }
         Ok(WorkflowTerminateResponse {
             workflow_id: workflow_id.to_owned(),
             status: terminal_status.to_owned(),
@@ -1698,6 +1725,35 @@ impl ExecutionPipeline {
     pub async fn workflow_queue_depth(&self) -> WorkflowQueueDepthResponse {
         let queue = self.workflow_queue.lock().await;
         WorkflowQueueDepthResponse { depth: queue.len() }
+    }
+
+    pub async fn get_workflow_dlq(&self) -> WorkflowDlqResponse {
+        let dlq = self.workflow_dlq.lock().await;
+        let jobs: Vec<FailedWorkflowJob> = dlq.iter().cloned().collect();
+        let total = jobs.len();
+        WorkflowDlqResponse { jobs, total }
+    }
+
+    async fn fire_workflow_callback(&self, workflow_id: &str, status: &str, url: &str) {
+        let client = self.notion_http_client.clone();
+        let url = url.to_owned();
+        let wid = workflow_id.to_owned();
+        let status = status.to_owned();
+        tokio::spawn(async move {
+            let payload = serde_json::json!({
+                "workflow_id": wid,
+                "status": status,
+                "fired_at": now_ms(),
+            });
+            match client.post(&url).json(&payload).send().await {
+                Ok(resp) => {
+                    info!(workflow_id = %wid, http_status = %resp.status(), "workflow callback delivered");
+                }
+                Err(err) => {
+                    warn!(workflow_id = %wid, error = %err, "workflow callback delivery failed");
+                }
+            }
+        });
     }
 
     async fn is_workflow_terminal(&self, workflow_id: &str) -> bool {
@@ -1775,10 +1831,28 @@ impl ExecutionPipeline {
                 }))
             }
             Err(error) => {
-                if matches!(error, PipelineError::LockUnavailable) {
+                let next_attempt = job.attempt.saturating_add(1);
+                if matches!(error, PipelineError::LockUnavailable)
+                    || next_attempt < MAX_WORKFLOW_JOB_ATTEMPTS
+                {
                     self.requeue_workflow_job(job, source).await;
                 } else {
                     self.ack_workflow_job_if_needed(&job, source).await;
+                    let failed = FailedWorkflowJob {
+                        workflow_id: job.workflow_id.clone(),
+                        session_id: job.session_id.clone(),
+                        step: job.step.clone(),
+                        attempt: job.attempt,
+                        failed_at: now_ms(),
+                        error: error.to_string(),
+                    };
+                    warn!(
+                        workflow_id = %failed.workflow_id,
+                        attempt = failed.attempt,
+                        error = %failed.error,
+                        "workflow job exhausted retries, moving to dead-letter queue"
+                    );
+                    self.workflow_dlq.lock().await.push_back(failed);
                 }
                 Err(error)
             }
@@ -2491,6 +2565,7 @@ impl ExecutionPipeline {
                             status: workflow.status,
                             current_step: workflow.current_step,
                             updated_at: workflow.updated_at,
+                            callback_url: None,
                         },
                     );
                 }
@@ -3978,6 +4053,7 @@ impl ExecutionPipeline {
                 status: "active".to_owned(),
                 current_step: step.to_owned(),
                 updated_at: now,
+                callback_url: None,
             };
             workflows.insert(workflow_id.to_owned(), record.clone());
             record
