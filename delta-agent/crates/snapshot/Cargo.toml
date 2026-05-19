@@ -1,0 +1,11 @@
+[package]
+name = "snapshot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+delta-core = { path = "../core" }
+deltashot = { path = "../deltashot" }

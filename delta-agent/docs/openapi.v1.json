@@ -1,0 +1,2486 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Delta Agent API",
+    "version": "1.0.0",
+    "description": "Deterministic, session-scoped command API with DeltaShot replayability, artifact versioning, workflow control, branching, and streaming."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080",
+      "description": "Local development server"
+    }
+  ],
+  "paths": {
+    "/api/v1/workspaces": {
+      "post": {
+        "summary": "Create workspace",
+        "operationId": "createWorkspace",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkspaceRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Workspace created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceCreateEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspaceId}": {
+      "get": {
+        "summary": "Get workspace",
+        "operationId": "getWorkspace",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/workspaceId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workspace detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceViewEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspaceId}/sessions": {
+      "get": {
+        "summary": "List sessions in workspace",
+        "operationId": "listWorkspaceSessions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/workspaceId"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 20
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionViewListEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions": {
+      "post": {
+        "summary": "Create session",
+        "operationId": "createSession",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionCreateEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}": {
+      "get": {
+        "summary": "Get session",
+        "operationId": "getSession",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionViewEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/messages": {
+      "post": {
+        "summary": "Send message (primary deterministic entrypoint)",
+        "operationId": "sendMessage",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequestV1"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Deterministic mutation snapshot delta",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendMessageResponseEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      },
+      "get": {
+        "summary": "Get message history",
+        "operationId": "getSessionMessages",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 50
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Message history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageRecordListEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/state": {
+      "get": {
+        "summary": "Get session state",
+        "operationId": "getSessionState",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session state snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionStateResponseEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/deltashots": {
+      "get": {
+        "summary": "List DeltaShots",
+        "operationId": "listDeltashots",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "DeltaShot list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeltashotViewListEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/deltashots/{deltashotId}": {
+      "get": {
+        "summary": "Get DeltaShot",
+        "operationId": "getDeltashot",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/deltashotId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "DeltaShot detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeltashotViewEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/rollback": {
+      "post": {
+        "summary": "Rollback session",
+        "operationId": "rollbackSession",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RollbackRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Rollback result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RollbackResponseEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/artifacts": {
+      "post": {
+        "summary": "Create or update artifact",
+        "operationId": "writeArtifact",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ArtifactWriteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Artifact delta",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactEnvelopeWithMeta"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/artifacts/{artifactId}": {
+      "get": {
+        "summary": "Get artifact",
+        "operationId": "getArtifact",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/artifactId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Artifact view",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactViewEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/artifacts/{artifactId}/versions": {
+      "get": {
+        "summary": "List artifact versions",
+        "operationId": "getArtifactVersions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/artifactId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Version list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactVersionViewListEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/artifacts/{artifactId}/versions/{version}": {
+      "get": {
+        "summary": "Get artifact version",
+        "operationId": "getArtifactVersion",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/artifactId"
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Version content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactVersionViewEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/workflows/start": {
+      "post": {
+        "summary": "Start workflow",
+        "operationId": "startWorkflow",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowStartRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Workflow state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowStateViewEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/workflows/execute-next": {
+      "post": {
+        "summary": "Execute next workflow job",
+        "operationId": "executeNextWorkflowJob",
+        "responses": {
+          "200": {
+            "description": "Execution result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecuteNextWorkflowEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/workflows/notion/execute-next": {
+      "post": {
+        "summary": "Execute next notion sync job",
+        "operationId": "executeNextNotionJob",
+        "responses": {
+          "200": {
+            "description": "Notion sync execution result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecuteNextNotionEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/workflows/{workflowId}/state": {
+      "get": {
+        "summary": "Get workflow state",
+        "operationId": "getWorkflowState",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/workflowId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowStateViewEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/workflows/{workflowId}/step": {
+      "post": {
+        "summary": "Advance workflow step",
+        "operationId": "advanceWorkflowStep",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/workflowId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowStepRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Workflow state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowStateViewEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/agent": {
+      "post": {
+        "summary": "Force agent selection",
+        "operationId": "forceAgentSelection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForceAgentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Forced agent confirmation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentSelectionViewEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/agents/logs": {
+      "get": {
+        "summary": "Get agent execution logs",
+        "operationId": "getAgentLogs",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Agent logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentLogEntryListEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/trace": {
+      "get": {
+        "summary": "Execution trace",
+        "operationId": "getTrace",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Trace view",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionTraceEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/branch": {
+      "post": {
+        "summary": "Create branch from specific DeltaShot",
+        "operationId": "createBranch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BranchCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Branch created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchCreateResponseEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/branches": {
+      "get": {
+        "summary": "List branches",
+        "operationId": "listBranches",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Branch list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchListResponseEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/branch/switch": {
+      "post": {
+        "summary": "Switch active branch",
+        "operationId": "switchBranch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BranchSwitchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Branch switched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchSwitchResponseEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/branch/merge": {
+      "post": {
+        "summary": "Merge source branch into target branch",
+        "operationId": "mergeBranch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BranchMergeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Merge complete",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchMergeResponseEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/messages/stream": {
+      "post": {
+        "summary": "Stream message execution (SSE)",
+        "operationId": "streamMessage",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional idempotency key for replay-safe streaming."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StreamMessageRequestV1"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Server-Sent Events stream. Event types: ack, token, message, deltashot, artifact, workflow, done, error.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "event: ack\ndata: {\"request_id\":\"req_123\"}\n\n"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/debug/sessions/{sessionId}/branches/{branchId}/audit": {
+      "post": {
+        "summary": "Run branch audit",
+        "operationId": "runBranchAudit",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          },
+          {
+            "$ref": "#/components/parameters/branchId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Branch audit report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchAuditResponseEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ApiError"
+          }
+        }
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "summary": "Health check",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Service health",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponseEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "workspaceId": {
+        "name": "workspaceId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "sessionId": {
+        "name": "sessionId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "deltashotId": {
+        "name": "deltashotId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "artifactId": {
+        "name": "artifactId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "workflowId": {
+        "name": "workflowId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "branchId": {
+        "name": "branchId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "ApiError": {
+        "description": "Standard API error envelope",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ApiMeta": {
+        "type": "object",
+        "required": [
+          "request_id",
+          "timestamp",
+          "latency_ms"
+        ],
+        "properties": {
+          "request_id": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "integer"
+          },
+          "latency_ms": {
+            "type": "integer"
+          }
+        }
+      },
+      "ApiError": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ApiErrorEnvelope": {
+        "type": "object",
+        "required": [
+          "error",
+          "meta"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ApiError"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ApiMeta"
+          }
+        }
+      },
+      "CreateWorkspaceRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateSessionRequest": {
+        "type": "object",
+        "required": [
+          "workspace_id",
+          "name"
+        ],
+        "properties": {
+          "workspace_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "MessageMode": {
+        "type": "string",
+        "enum": [
+          "chat",
+          "workflow",
+          "execution"
+        ]
+      },
+      "SendMessageRequestV1": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/MessageMode",
+            "default": "chat"
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "StreamMessageRequestV1": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/MessageMode",
+            "default": "chat"
+          },
+          "stream": {
+            "type": "boolean",
+            "default": true
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "RollbackRequest": {
+        "type": "object",
+        "required": [
+          "target_deltashot_id",
+          "mode"
+        ],
+        "properties": {
+          "target_deltashot_id": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "hard",
+              "soft"
+            ]
+          }
+        }
+      },
+      "ArtifactWriteRequest": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "type",
+          "content"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "WorkflowStartRequest": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "workflow_id"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "workflow_id": {
+            "type": "string"
+          },
+          "input": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "WorkflowStepRequest": {
+        "type": "object",
+        "properties": {
+          "step": {
+            "type": "string",
+            "default": "next"
+          },
+          "payload": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "ForceAgentRequest": {
+        "type": "object",
+        "required": [
+          "agent",
+          "reason"
+        ],
+        "properties": {
+          "agent": {
+            "type": "string",
+            "enum": [
+              "claude",
+              "deepseek"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "BranchCreateRequest": {
+        "type": "object",
+        "required": [
+          "from_deltashot_id",
+          "label"
+        ],
+        "properties": {
+          "from_deltashot_id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "soft",
+              "hard"
+            ],
+            "default": "soft"
+          }
+        }
+      },
+      "BranchSwitchRequest": {
+        "type": "object",
+        "required": [
+          "branch_id"
+        ],
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          }
+        }
+      },
+      "BranchMergeRequest": {
+        "type": "object",
+        "required": [
+          "source_branch",
+          "target_branch",
+          "strategy"
+        ],
+        "properties": {
+          "source_branch": {
+            "type": "string"
+          },
+          "target_branch": {
+            "type": "string"
+          },
+          "strategy": {
+            "type": "string",
+            "enum": [
+              "fast-forward",
+              "rebase",
+              "manual"
+            ]
+          }
+        }
+      },
+      "WorkspaceCreateResponse": {
+        "type": "object",
+        "required": [
+          "workspace_id",
+          "created_at"
+        ],
+        "properties": {
+          "workspace_id": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          }
+        }
+      },
+      "WorkspaceView": {
+        "type": "object",
+        "required": [
+          "workspace_id",
+          "name",
+          "created_at",
+          "owner_id"
+        ],
+        "properties": {
+          "workspace_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "owner_id": {
+            "type": "string"
+          },
+          "active_session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "SessionCreateResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "created_at"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          }
+        }
+      },
+      "SessionView": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "status",
+          "state_version"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "workflow_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state_version": {
+            "type": "integer"
+          }
+        }
+      },
+      "MessageEnvelope": {
+        "type": "object",
+        "required": [
+          "id",
+          "role",
+          "content"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          }
+        }
+      },
+      "DeltaShotEnvelope": {
+        "type": "object",
+        "required": [
+          "id",
+          "timestamp"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "integer"
+          }
+        }
+      },
+      "StateSummary": {
+        "type": "object",
+        "properties": {
+          "goal": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "step": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "StateEnvelope": {
+        "type": "object",
+        "required": [
+          "version",
+          "summary"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/StateSummary"
+          }
+        }
+      },
+      "ArtifactEnvelope": {
+        "type": "object",
+        "required": [
+          "artifact_id",
+          "version",
+          "type"
+        ],
+        "properties": {
+          "artifact_id": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "WorkflowEnvelope": {
+        "type": "object",
+        "required": [
+          "active",
+          "step"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "step": {
+            "type": "string"
+          }
+        }
+      },
+      "SendMessageResponseV1": {
+        "type": "object",
+        "required": [
+          "message",
+          "deltashot",
+          "state",
+          "artifacts",
+          "workflow"
+        ],
+        "properties": {
+          "message": {
+            "$ref": "#/components/schemas/MessageEnvelope"
+          },
+          "deltashot": {
+            "$ref": "#/components/schemas/DeltaShotEnvelope"
+          },
+          "state": {
+            "$ref": "#/components/schemas/StateEnvelope"
+          },
+          "artifacts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArtifactEnvelope"
+            }
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEnvelope"
+          }
+        }
+      },
+      "SessionStateResponse": {
+        "type": "object",
+        "required": [
+          "state",
+          "version"
+        ],
+        "properties": {
+          "state": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "version": {
+            "type": "integer"
+          },
+          "last_deltashot": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "MessageRecord": {
+        "type": "object",
+        "required": [
+          "id",
+          "role",
+          "content",
+          "timestamp"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "integer"
+          }
+        }
+      },
+      "DeltashotView": {
+        "type": "object",
+        "required": [
+          "id",
+          "timestamp",
+          "type",
+          "diff",
+          "hash"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "integer"
+          },
+          "type": {
+            "type": "string"
+          },
+          "diff": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "hash": {
+            "type": "string"
+          },
+          "prev_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "RollbackResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "current_state_version",
+          "new_deltashot_id"
+        ],
+        "properties": {
+          "status": {
+            "type": "string"
+          },
+          "current_state_version": {
+            "type": "integer"
+          },
+          "new_deltashot_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ArtifactView": {
+        "type": "object",
+        "required": [
+          "artifact_id",
+          "session_id",
+          "type",
+          "current_version",
+          "created_at"
+        ],
+        "properties": {
+          "artifact_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "current_version": {
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "integer"
+          }
+        }
+      },
+      "ArtifactVersionView": {
+        "type": "object",
+        "required": [
+          "version",
+          "content"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer"
+          },
+          "content": {
+            "type": "string"
+          }
+        }
+      },
+      "WorkflowStateView": {
+        "type": "object",
+        "required": [
+          "workflow_id",
+          "status",
+          "current_step"
+        ],
+        "properties": {
+          "workflow_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_step": {
+            "type": "string"
+          }
+        }
+      },
+      "WorkflowExecutionResult": {
+        "type": "object",
+        "required": [
+          "workflow_id",
+          "session_id",
+          "step",
+          "deltashot_id",
+          "state_version"
+        ],
+        "properties": {
+          "workflow_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step": {
+            "type": "string"
+          },
+          "deltashot_id": {
+            "type": "string"
+          },
+          "state_version": {
+            "type": "integer"
+          }
+        }
+      },
+      "NotionSyncExecutionResult": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "artifacts_count",
+          "summary_preview",
+          "status",
+          "detail"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "artifacts_count": {
+            "type": "integer"
+          },
+          "summary_preview": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
+      "VerificationResult": {
+        "type": "object",
+        "required": [
+          "valid",
+          "verified_count",
+          "failed_at",
+          "error"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean"
+          },
+          "verified_count": {
+            "type": "integer"
+          },
+          "failed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ReplayAuditResult": {
+        "type": "object",
+        "required": [
+          "valid",
+          "final_state_match",
+          "hash_match"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean"
+          },
+          "final_state_match": {
+            "type": "boolean"
+          },
+          "hash_match": {
+            "type": "boolean"
+          }
+        }
+      },
+      "BranchAuditResponse": {
+        "type": "object",
+        "required": [
+          "branch_id",
+          "valid",
+          "chain",
+          "replay"
+        ],
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          },
+          "valid": {
+            "type": "boolean"
+          },
+          "chain": {
+            "$ref": "#/components/schemas/VerificationResult"
+          },
+          "replay": {
+            "$ref": "#/components/schemas/ReplayAuditResult"
+          }
+        }
+      },
+      "AgentSelectionView": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "agent",
+          "reason"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "agent": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "AgentLogEntry": {
+        "type": "object",
+        "required": [
+          "ts",
+          "selected_agent",
+          "reason"
+        ],
+        "properties": {
+          "ts": {
+            "type": "integer"
+          },
+          "selected_agent": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "StateTransitionView": {
+        "type": "object",
+        "required": [
+          "event_id",
+          "type",
+          "payload",
+          "timestamp"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "timestamp": {
+            "type": "integer"
+          }
+        }
+      },
+      "ExecutionTrace": {
+        "type": "object",
+        "required": [
+          "messages",
+          "deltashots",
+          "state_transitions",
+          "artifacts"
+        ],
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MessageRecord"
+            }
+          },
+          "deltashots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeltashotView"
+            }
+          },
+          "state_transitions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StateTransitionView"
+            }
+          },
+          "artifacts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArtifactEnvelope"
+            }
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok"
+            ]
+          }
+        }
+      },
+      "BranchPointer": {
+        "type": "object",
+        "required": [
+          "branch_id",
+          "parent_deltashot_id",
+          "created_at"
+        ],
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          },
+          "parent_deltashot_id": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          }
+        }
+      },
+      "BranchStateView": {
+        "type": "object",
+        "required": [
+          "version",
+          "forked"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer"
+          },
+          "forked": {
+            "type": "boolean"
+          }
+        }
+      },
+      "BranchCreateResponse": {
+        "type": "object",
+        "required": [
+          "branch",
+          "state"
+        ],
+        "properties": {
+          "branch": {
+            "$ref": "#/components/schemas/BranchPointer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/BranchStateView"
+          }
+        }
+      },
+      "BranchSummary": {
+        "type": "object",
+        "required": [
+          "branch_id",
+          "is_main"
+        ],
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          },
+          "is_main": {
+            "type": "boolean"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "BranchListResponse": {
+        "type": "object",
+        "required": [
+          "branches"
+        ],
+        "properties": {
+          "branches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BranchSummary"
+            }
+          }
+        }
+      },
+      "BranchSwitchResponse": {
+        "type": "object",
+        "required": [
+          "branch_id",
+          "status"
+        ],
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "BranchMergeResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "new_deltashot_id"
+        ],
+        "properties": {
+          "status": {
+            "type": "string"
+          },
+          "new_deltashot_id": {
+            "type": "string"
+          }
+        }
+      },
+      "WorkspaceCreateEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WorkspaceCreateResponse"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "WorkspaceViewEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WorkspaceView"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "SessionCreateEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SessionCreateResponse"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "SessionViewListEnvelope": {
+        "type": "object",
+        "required": [
+          "value",
+          "meta"
+        ],
+        "properties": {
+          "value": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionView"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ApiMeta"
+          }
+        }
+      },
+      "SendMessageResponseEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SendMessageResponseV1"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "SessionStateResponseEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SessionStateResponse"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "MessageRecordListEnvelope": {
+        "type": "object",
+        "required": [
+          "value",
+          "meta"
+        ],
+        "properties": {
+          "value": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MessageRecord"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ApiMeta"
+          }
+        }
+      },
+      "DeltashotViewListEnvelope": {
+        "type": "object",
+        "required": [
+          "value",
+          "meta"
+        ],
+        "properties": {
+          "value": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeltashotView"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ApiMeta"
+          }
+        }
+      },
+      "DeltashotViewEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/DeltashotView"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "RollbackResponseEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/RollbackResponse"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "ArtifactEnvelopeWithMeta": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ArtifactEnvelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "ArtifactViewEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ArtifactView"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "ArtifactVersionViewListEnvelope": {
+        "type": "object",
+        "required": [
+          "value",
+          "meta"
+        ],
+        "properties": {
+          "value": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArtifactVersionView"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ApiMeta"
+          }
+        }
+      },
+      "ArtifactVersionViewEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ArtifactVersionView"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "WorkflowStateViewEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WorkflowStateView"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "SessionViewEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SessionView"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "ExecuteNextWorkflowEnvelope": {
+        "type": "object",
+        "required": [
+          "executed",
+          "result",
+          "meta"
+        ],
+        "properties": {
+          "executed": {
+            "type": "boolean"
+          },
+          "result": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowExecutionResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ApiMeta"
+          }
+        }
+      },
+      "ExecuteNextNotionEnvelope": {
+        "type": "object",
+        "required": [
+          "executed",
+          "result",
+          "meta"
+        ],
+        "properties": {
+          "executed": {
+            "type": "boolean"
+          },
+          "result": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NotionSyncExecutionResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ApiMeta"
+          }
+        }
+      },
+      "WorkflowExecutionResultEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WorkflowExecutionResult"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "BranchAuditResponseEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BranchAuditResponse"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "AgentSelectionViewEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AgentSelectionView"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "AgentLogEntryListEnvelope": {
+        "type": "object",
+        "required": [
+          "value",
+          "meta"
+        ],
+        "properties": {
+          "value": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AgentLogEntry"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ApiMeta"
+          }
+        }
+      },
+      "ExecutionTraceEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ExecutionTrace"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "HealthResponseEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/HealthResponse"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "BranchCreateResponseEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BranchCreateResponse"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "BranchListResponseEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BranchListResponse"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "BranchSwitchResponseEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BranchSwitchResponse"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      },
+      "BranchMergeResponseEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BranchMergeResponse"
+          },
+          {
+            "type": "object",
+            "required": [
+              "meta"
+            ],
+            "properties": {
+              "meta": {
+                "$ref": "#/components/schemas/ApiMeta"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
