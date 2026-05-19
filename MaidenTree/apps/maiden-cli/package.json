@@ -1,0 +1,23 @@
+{
+  "name": "maiden-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "ink": "^5",
+    "react": "^19",
+    "meow": "^13",
+    "chalk": "^5",
+    "@grpc/grpc-js": "^1.10",
+    "@protobuf-ts/runtime": "^2",
+    "csv-parse": "^5"
+  },
+  "devDependencies": {
+    "@types/react": "^19",
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  garden:
+    build: ./docker/garden
+    ports:
+      - "4000:4000"
+      - "50051:50051"
+    environment:
+      - MIX_ENV=prod
+
+  maiden-ui:
+    build: ./docker/maiden-ui
+    ports:
+      - "3000:3000"
+    depends_on:
+      - garden
