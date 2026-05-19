@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agents::client::{AgentClient, AgentHttpClient};
 use crate::agents::config::AgentRuntimeConfig;
@@ -174,7 +174,7 @@ impl AgentClient for DeepSeekClient {
                 .map_err(|err| AgentError::Transport(err.to_string()))?;
             let response = AgentHttpClient::ensure_success(response).await?;
 
-            let (tx, rx) = mpsc::unbounded_channel::<Result<AgentStreamEvent, AgentError>>();
+            let (tx, rx) = mpsc::channel::<Result<AgentStreamEvent, AgentError>>(64);
             let idle_timeout = self.config.stream_idle_timeout();
             tokio::spawn(async move {
                 let mut stream = response.bytes_stream();
@@ -183,20 +183,22 @@ impl AgentClient for DeepSeekClient {
                     let next_chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
                         Ok(item) => item,
                         Err(_) => {
-                            let _ = tx.send(Err(AgentError::Timeout {
-                                stage: "stream_idle".to_owned(),
-                            }));
+                            let _ = tx
+                                .send(Err(AgentError::Timeout {
+                                    stage: "stream_idle".to_owned(),
+                                }))
+                                .await;
                             return;
                         }
                     };
                     let Some(chunk_result) = next_chunk else {
-                        let _ = tx.send(Err(AgentError::StreamTerminated));
+                        let _ = tx.send(Err(AgentError::StreamTerminated)).await;
                         return;
                     };
                     let chunk = match chunk_result {
                         Ok(chunk) => chunk,
                         Err(err) => {
-                            let _ = tx.send(Err(AgentError::Transport(err.to_string())));
+                            let _ = tx.send(Err(AgentError::Transport(err.to_string()))).await;
                             return;
                         }
                     };
@@ -212,16 +214,19 @@ impl AgentClient for DeepSeekClient {
                             continue;
                         }
                         if data == "[DONE]" {
-                            let _ = tx.send(Ok(AgentStreamEvent::Done {
-                                model: model.clone(),
-                                finish_reason: None,
-                            }));
+                            let _ = tx
+                                .send(Ok(AgentStreamEvent::Done {
+                                    model: model.clone(),
+                                    finish_reason: None,
+                                }))
+                                .await;
                             return;
                         }
                         let parsed: Value = match serde_json::from_str(data) {
                             Ok(value) => value,
                             Err(err) => {
-                                let _ = tx.send(Err(AgentError::Deserialize(err.to_string())));
+                                let _ =
+                                    tx.send(Err(AgentError::Deserialize(err.to_string()))).await;
                                 return;
                             }
                         };
@@ -240,30 +245,34 @@ impl AgentClient for DeepSeekClient {
                                     .and_then(Value::as_u64)
                                     .unwrap_or(0),
                             };
-                            let _ = tx.send(Ok(AgentStreamEvent::Usage { usage }));
+                            let _ = tx.send(Ok(AgentStreamEvent::Usage { usage })).await;
                         }
                         if let Some(delta) = parsed
                             .pointer("/choices/0/delta/content")
                             .and_then(Value::as_str)
                         {
-                            let _ = tx.send(Ok(AgentStreamEvent::Token {
-                                delta: delta.to_owned(),
-                            }));
+                            let _ = tx
+                                .send(Ok(AgentStreamEvent::Token {
+                                    delta: delta.to_owned(),
+                                }))
+                                .await;
                         }
                         if let Some(finish_reason) = parsed
                             .pointer("/choices/0/finish_reason")
                             .and_then(Value::as_str)
                         {
-                            let _ = tx.send(Ok(AgentStreamEvent::Done {
-                                model: model.clone(),
-                                finish_reason: Some(finish_reason.to_owned()),
-                            }));
+                            let _ = tx
+                                .send(Ok(AgentStreamEvent::Done {
+                                    model: model.clone(),
+                                    finish_reason: Some(finish_reason.to_owned()),
+                                }))
+                                .await;
                             return;
                         }
                     }
                 }
             });
-            let stream: AgentStream = Box::pin(UnboundedReceiverStream::new(rx));
+            let stream: AgentStream = Box::pin(ReceiverStream::new(rx));
             Ok(stream)
         })
     }

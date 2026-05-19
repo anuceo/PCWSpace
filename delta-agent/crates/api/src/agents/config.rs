@@ -12,6 +12,8 @@ const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
 const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-chat";
+const DEFAULT_MAX_CONCURRENT_CLAUDE: usize = 16;
+const DEFAULT_MAX_CONCURRENT_DEEPSEEK: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct AgentRuntimeConfig {
@@ -28,6 +30,10 @@ pub struct AgentRuntimeConfig {
     pub deepseek_base_url: String,
     pub deepseek_api_key: Option<String>,
     pub deepseek_model: String,
+    /// 0 means unlimited
+    pub max_concurrent_claude: usize,
+    /// 0 means unlimited
+    pub max_concurrent_deepseek: usize,
 }
 
 impl Default for AgentRuntimeConfig {
@@ -46,6 +52,8 @@ impl Default for AgentRuntimeConfig {
             deepseek_base_url: DEFAULT_DEEPSEEK_BASE_URL.to_owned(),
             deepseek_api_key: None,
             deepseek_model: DEFAULT_DEEPSEEK_MODEL.to_owned(),
+            max_concurrent_claude: DEFAULT_MAX_CONCURRENT_CLAUDE,
+            max_concurrent_deepseek: DEFAULT_MAX_CONCURRENT_DEEPSEEK,
         }
     }
 }
@@ -75,6 +83,10 @@ impl AgentRuntimeConfig {
             read_string_env("DEEPSEEK_BASE_URL").unwrap_or(config.deepseek_base_url);
         config.deepseek_api_key = read_string_env("DEEPSEEK_API_KEY");
         config.deepseek_model = read_string_env("DEEPSEEK_MODEL").unwrap_or(config.deepseek_model);
+        config.max_concurrent_claude =
+            read_usize_env("AGENT_MAX_CONCURRENT_CLAUDE", config.max_concurrent_claude);
+        config.max_concurrent_deepseek =
+            read_usize_env("AGENT_MAX_CONCURRENT_DEEPSEEK", config.max_concurrent_deepseek);
         if use_real_agents_explicit.is_none()
             && (config.anthropic_api_key.is_some() || config.deepseek_api_key.is_some())
         {
@@ -122,6 +134,13 @@ fn read_u32_env(key: &str, default: u32) -> u32 {
     std::env::var(key)
         .ok()
         .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn read_usize_env(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
         .unwrap_or(default)
 }
 

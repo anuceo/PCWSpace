@@ -29,8 +29,18 @@ impl RetryPolicy {
             .base_delay
             .as_millis()
             .saturating_mul(u128::from(factor));
-        let bounded = scaled.min(self.max_delay.as_millis());
-        Duration::from_millis(bounded as u64)
+        let bounded = scaled.min(self.max_delay.as_millis()) as u64;
+        if bounded == 0 {
+            return Duration::ZERO;
+        }
+        // ±25% jitter using subsecond nanoseconds as cheap entropy
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        // factor_per_mille: 750..1249 → 75%..125% of bounded
+        let factor_per_mille = 750u64 + (nanos % 500) as u64;
+        Duration::from_millis(bounded * factor_per_mille / 1000)
     }
 }
 
@@ -51,7 +61,12 @@ where
                 if !should_retry {
                     return Err(err);
                 }
-                let delay = policy.delay_for_attempt(attempt);
+                let delay = match &err {
+                    AgentError::RateLimited {
+                        retry_after_ms: Some(ms),
+                    } => Duration::from_millis(*ms),
+                    _ => policy.delay_for_attempt(attempt),
+                };
                 sleep(delay).await;
                 attempt = attempt.saturating_add(1);
             }

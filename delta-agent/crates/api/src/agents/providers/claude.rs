@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agents::client::{AgentClient, AgentHttpClient};
 use crate::agents::config::AgentRuntimeConfig;
@@ -181,7 +181,7 @@ impl AgentClient for ClaudeClient {
                 .map_err(|err| AgentError::Transport(err.to_string()))?;
             let response = AgentHttpClient::ensure_success(response).await?;
 
-            let (tx, rx) = mpsc::unbounded_channel::<Result<AgentStreamEvent, AgentError>>();
+            let (tx, rx) = mpsc::channel::<Result<AgentStreamEvent, AgentError>>(64);
             let idle_timeout = self.config.stream_idle_timeout();
             tokio::spawn(async move {
                 let mut stream = response.bytes_stream();
@@ -193,20 +193,22 @@ impl AgentClient for ClaudeClient {
                     let next_chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
                         Ok(item) => item,
                         Err(_) => {
-                            let _ = tx.send(Err(AgentError::Timeout {
-                                stage: "stream_idle".to_owned(),
-                            }));
+                            let _ = tx
+                                .send(Err(AgentError::Timeout {
+                                    stage: "stream_idle".to_owned(),
+                                }))
+                                .await;
                             return;
                         }
                     };
                     let Some(chunk_result) = next_chunk else {
-                        let _ = tx.send(Err(AgentError::StreamTerminated));
+                        let _ = tx.send(Err(AgentError::StreamTerminated)).await;
                         return;
                     };
                     let chunk = match chunk_result {
                         Ok(chunk) => chunk,
                         Err(err) => {
-                            let _ = tx.send(Err(AgentError::Transport(err.to_string())));
+                            let _ = tx.send(Err(AgentError::Transport(err.to_string()))).await;
                             return;
                         }
                     };
@@ -222,16 +224,19 @@ impl AgentClient for ClaudeClient {
                             continue;
                         }
                         if data == "[DONE]" {
-                            let _ = tx.send(Ok(AgentStreamEvent::Done {
-                                model: model.clone(),
-                                finish_reason: stop_reason.clone(),
-                            }));
+                            let _ = tx
+                                .send(Ok(AgentStreamEvent::Done {
+                                    model: model.clone(),
+                                    finish_reason: stop_reason.clone(),
+                                }))
+                                .await;
                             return;
                         }
                         let parsed: Value = match serde_json::from_str(data) {
                             Ok(value) => value,
                             Err(err) => {
-                                let _ = tx.send(Err(AgentError::Deserialize(err.to_string())));
+                                let _ =
+                                    tx.send(Err(AgentError::Deserialize(err.to_string()))).await;
                                 return;
                             }
                         };
@@ -245,9 +250,11 @@ impl AgentClient for ClaudeClient {
                                     usage.input_tokens = input_tokens;
                                     usage.total_tokens =
                                         usage.input_tokens.saturating_add(usage.output_tokens);
-                                    let _ = tx.send(Ok(AgentStreamEvent::Usage {
-                                        usage: usage.clone(),
-                                    }));
+                                    let _ = tx
+                                        .send(Ok(AgentStreamEvent::Usage {
+                                            usage: usage.clone(),
+                                        }))
+                                        .await;
                                 }
                             }
                             "content_block_delta" => {
@@ -256,7 +263,8 @@ impl AgentClient for ClaudeClient {
                                     .and_then(Value::as_str)
                                     .map(str::to_owned)
                                 {
-                                    let _ = tx.send(Ok(AgentStreamEvent::Token { delta: text }));
+                                    let _ =
+                                        tx.send(Ok(AgentStreamEvent::Token { delta: text })).await;
                                 }
                             }
                             "message_delta" => {
@@ -272,16 +280,20 @@ impl AgentClient for ClaudeClient {
                                     usage.output_tokens = output_tokens;
                                     usage.total_tokens =
                                         usage.input_tokens.saturating_add(usage.output_tokens);
-                                    let _ = tx.send(Ok(AgentStreamEvent::Usage {
-                                        usage: usage.clone(),
-                                    }));
+                                    let _ = tx
+                                        .send(Ok(AgentStreamEvent::Usage {
+                                            usage: usage.clone(),
+                                        }))
+                                        .await;
                                 }
                             }
                             "message_stop" => {
-                                let _ = tx.send(Ok(AgentStreamEvent::Done {
-                                    model: model.clone(),
-                                    finish_reason: stop_reason.clone(),
-                                }));
+                                let _ = tx
+                                    .send(Ok(AgentStreamEvent::Done {
+                                        model: model.clone(),
+                                        finish_reason: stop_reason.clone(),
+                                    }))
+                                    .await;
                                 return;
                             }
                             _ => {}
@@ -289,7 +301,7 @@ impl AgentClient for ClaudeClient {
                     }
                 }
             });
-            let stream: AgentStream = Box::pin(UnboundedReceiverStream::new(rx));
+            let stream: AgentStream = Box::pin(ReceiverStream::new(rx));
             Ok(stream)
         })
     }

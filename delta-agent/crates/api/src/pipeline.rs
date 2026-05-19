@@ -882,6 +882,7 @@ impl std::fmt::Debug for LazyRepo {
 #[derive(Debug)]
 pub struct ExecutionPipeline {
     agent_runtime_config: AgentRuntimeConfig,
+    agent_router: Option<std::sync::Arc<RealAgentRouter>>,
     notion_sync_config: NotionSyncConfig,
     notion_http_client: reqwest::Client,
     keyspace: RedisKeyspace,
@@ -923,8 +924,14 @@ impl ExecutionPipeline {
                 PipelineError::Internal(format!("notion HTTP client setup failed: {err}"))
             })?;
 
+        let agent_runtime_config = AgentRuntimeConfig::from_env();
+        let agent_router = RealAgentRouter::new(agent_runtime_config.clone())
+            .ok()
+            .map(std::sync::Arc::new);
+
         Ok(Self {
-            agent_runtime_config: AgentRuntimeConfig::from_env(),
+            agent_runtime_config,
+            agent_router,
             notion_sync_config,
             notion_http_client,
             keyspace,
@@ -3514,8 +3521,11 @@ impl ExecutionPipeline {
         self.append_agent_log(session_id, &agent, &reason).await;
         let mut accumulated = if self.agent_runtime_config.use_real_agents {
             let provider = map_agent_kind(agent);
-            let router =
-                RealAgentRouter::new(self.agent_runtime_config.clone()).map_err(map_agent_error)?;
+            let router = self.agent_router.as_ref().ok_or_else(|| {
+                map_agent_error(AgentError::Configuration(
+                    "agent router not initialized".to_owned(),
+                ))
+            })?;
             let mut stream = router
                 .stream(
                     provider,
@@ -3726,8 +3736,11 @@ impl ExecutionPipeline {
             temperature: None,
         };
         let provider = map_agent_kind(agent);
-        let router =
-            RealAgentRouter::new(self.agent_runtime_config.clone()).map_err(map_agent_error)?;
+        let router = self.agent_router.as_ref().ok_or_else(|| {
+            map_agent_error(AgentError::Configuration(
+                "agent router not initialized".to_owned(),
+            ))
+        })?;
         let result = router
             .complete(provider, agent_request)
             .await
